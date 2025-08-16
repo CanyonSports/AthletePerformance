@@ -1,0 +1,45 @@
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { --bg: #0b0c0d; --glass: rgba(255,255,255,0.05); --glass-border: rgba(255,255,255,0.08); --pine:#2F6F4F; }
+html, body { height: 100%; background: radial-gradient(1000px 500px at 120% 20%, rgba(47,111,79,.20), transparent 30%), var(--bg); color: #e5e7eb; }
+.card { @apply rounded-2xl; background: var(--glass); border: 1px solid var(--glass-border); box-shadow: 0 8px 30px rgba(0,0,0,.35); }
+.btn { @apply rounded-lg px-4 py-2 transition-colors; }
+.btn-pine { @apply btn; background: var(--pine); }
+.btn-pine:hover { filter: brightness(1.08); }
+.btn-dark { @apply btn bg-slate-800 hover:bg-slate-700; }
+.badge { @apply text-[11px] px-2 py-1 rounded; background: rgba(47,111,79,.18); color: #b7e0c5; border: 1px solid rgba(47,111,79,.35); }
+.kpi { background: linear-gradient(135deg, rgba(47,111,79,.18), rgba(255,255,255,.04)); }
+
+/* --- High-contrast, readable form fields --- */
+.field {
+  background: rgba(255,255,255,0.10);
+  border: 1px solid rgba(255,255,255,0.18);
+  color: #f8fafc;              /* slate-50 */
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.field::placeholder { color: rgba(248,250,252,0.65); }
+.field:focus {
+  outline: 2px solid rgba(220,38,38,0.35);  /* red focus */
+  outline-offset: 0;
+  border-color: rgba(220,38,38,0.5);
+  box-shadow: 0 0 0 3px rgba(220,38,38,0.15);
+}
+
+/* Date inputs: use light color scheme for built-in pickers (better contrast) */
+.field--date {
+  background: #ffffff;
+  color: #0f172a;              /* slate-900 */
+  border-color: #e5e7eb;       /* gray-200 */
+  color-scheme: light;         /* important so calendar popup is readable */
+}
+input[type="date"].field { appearance: auto; }
+::-webkit-calendar-picker-indicator { opacity: .85; }
+
+/* Make textareas tall enough to write comfortably */
+textarea.field { min-height: 110px; }

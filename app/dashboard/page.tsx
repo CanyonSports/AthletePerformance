@@ -1,0 +1,144 @@
+
+"use client";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import NavBar from "@/components/NavBar";
+import KpiCard from "@/components/KpiCard";
+import RecentTable from "@/components/RecentTable";
+import { KPI_BY_SPORT } from "@/lib/kpis";
+import type { MeasurementRow } from "@/lib/types";
+import { getSupabase } from "@/lib/supabaseClient";
+import { Hand, Dumbbell, Timer, Activity } from "lucide-react";
+import { useRouter } from "next/navigation";
+
+export default function Dashboard(){
+  const [sport, setSport] = useState("climbing");
+  const [rows, setRows] = useState<MeasurementRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [note, setNote] = useState<string>("");
+  const router = useRouter();
+
+  const fetchRows = useCallback(async () => {
+    setLoading(true);
+    setNote("");
+    try {
+      const supabase = getSupabase();
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) { router.push("/login"); return; }
+      const { data, error } = await supabase
+        .from("measurements")
+        .select("*")
+        .eq("user_id", user.id)
+        .eq("sport", sport)
+        .order("test_date", { ascending: true });
+      if (error) throw error;
+      setRows((data || []) as MeasurementRow[]);
+    } catch (e: any) {
+      setNote(e.message ?? String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [sport, router]);
+
+  useEffect(() => { fetchRows(); }, [fetchRows]);
+
+  useEffect(() => {
+  let isMounted = true;
+  let channel: any = null;
+
+  (async () => {
+    try {
+      const supabase = getSupabase();
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return;
+
+      channel = supabase
+        .channel("csp-measurements")
+        .on("postgres_changes", {
+          event: "*",
+          schema: "public",
+          table: "measurements",
+          filter: `user_id=eq.${user.id}`
+        }, () => { if (isMounted) fetchRows(); })
+        .subscribe();
+    } catch (e) {
+      // optional: console.warn("realtime subscribe failed", e);
+    }
+  })();
+
+  return () => {
+    isMounted = false;
+    try {
+      if (channel) {
+        // Preferred for supabase-js v2
+        getSupabase().removeChannel(channel);
+        // Fallback if removeChannel isn't available in your runtime
+        channel?.unsubscribe?.();
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+}, [fetchRows]);
+
+
+  const kpis = useMemo(() => KPI_BY_SPORT[sport] || [], [sport]);
+  const labels = rows.map(r => r.test_date ?? "");
+  const iconFor = (label: string) => {
+    if (label.includes("Grip")) return <Hand className="text-emerald-300" />;
+    if (label.includes("Pull")) return <Dumbbell className="text-emerald-300" />;
+    if (label.includes("Hang")) return <Timer className="text-emerald-300" />;
+    return <Activity className="text-emerald-300" />;
+  };
+
+  return (
+    <div className="max-w-7xl mx-auto pb-10">
+      <NavBar />
+
+      {/* Sport & context */}
+      <div className="mt-6 card p-4 flex flex-wrap items-center gap-3">
+        <div>
+          <p className="text-xs text-slate-400">You’re viewing</p>
+          <h2 className="text-2xl font-semibold leading-tight">Performance — <span className="text-csp-white">{sport.toUpperCase()}</span></h2>
+          {note ? <p className="text-xs text-slate-400 mt-1">{note}</p> : null}
+        </div>
+        <div className="ml-auto flex items-center gap-2">
+          <span className="text-sm text-slate-300">Sport:</span>
+          <select value={sport} onChange={e=>setSport(e.target.value)} className="px-3 py-2 rounded bg-white/5 border border-white/10">
+            <option value="climbing">Climbing</option>
+            <option value="ski">Ski</option>
+            <option value="mtb">MTB</option>
+            <option value="running">Running</option>
+          </select>
+        </div>
+      </div>
+
+      {/* KPIs */}
+      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-5 mt-6">
+        {kpis.map(k => {
+          const series = rows.map(r => {
+            const v = r.data?.[k.key];
+            return typeof v === "number" ? v : (v != null ? Number(v) : null);
+          });
+          return (
+            <KpiCard
+              key={k.key}
+              title={k.label}
+              value={(() => { try { return k.compute(rows); } catch { return null; } })()}
+              sub={series.some(x => x!=null) ? "Last " + series.filter(x => x!=null).length + " tests" : undefined}
+              series={series}
+              labels={labels}
+              icon={iconFor(k.label)}
+            />
+          );
+        })}
+      </div>
+
+      {/* History */}
+      <div className="mt-6">
+        {loading ? <div className="card p-4">Loading…</div> : (
+          rows.length ? <RecentTable rows={[...rows].slice(-12).reverse()} /> : <div className="card p-4">No tests yet. Head to <a className="underline" href="/log">Log a Test</a>.</div>
+        )}
+      </div>
+    </div>
+  );
+}

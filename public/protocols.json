@@ -1,0 +1,94 @@
+[
+  {
+    "id": "climb-basic",
+    "sport": "climbing",
+    "name": "Climbing \u2014 Basic Screen",
+    "description": "Grip, Max Hang, Pull-ups",
+    "metrics": [
+      {
+        "key": "grip_left_kg",
+        "type": "number",
+        "unit": "kg",
+        "label": "Grip Left"
+      },
+      {
+        "key": "grip_right_kg",
+        "type": "number",
+        "unit": "kg",
+        "label": "Grip Right"
+      },
+      {
+        "key": "max_hang_s",
+        "type": "number",
+        "unit": "s",
+        "label": "Max Hang (s)"
+      },
+      {
+        "key": "pullups_max",
+        "type": "number",
+        "unit": "reps",
+        "label": "Max Pull-ups"
+      }
+    ]
+  },
+  {
+    "id": "ski-preseason",
+    "sport": "ski",
+    "name": "Ski \u2014 Pre-Season",
+    "description": "CMJ + Strength",
+    "metrics": [
+      {
+        "key": "cmj_height_cm",
+        "type": "number",
+        "unit": "cm",
+        "label": "CMJ Height"
+      },
+      {
+        "key": "quad_strength_nm",
+        "type": "number",
+        "unit": "Nm",
+        "label": "Quad Strength"
+      }
+    ]
+  },
+  {
+    "id": "mtb-power",
+    "sport": "mtb",
+    "name": "MTB \u2014 Power Test",
+    "description": "Peak power windows",
+    "metrics": [
+      {
+        "key": "p30s_w",
+        "type": "number",
+        "unit": "W",
+        "label": "30s Peak Power"
+      },
+      {
+        "key": "power_kg",
+        "type": "number",
+        "unit": "W/kg",
+        "label": "Power/Weight"
+      }
+    ]
+  },
+  {
+    "id": "run-gait-basic",
+    "sport": "running",
+    "name": "Running \u2014 Gait Basics",
+    "description": "5k time + cadence",
+    "metrics": [
+      {
+        "key": "fivek_time_s",
+        "type": "number",
+        "unit": "s",
+        "label": "5k Time"
+      },
+      {
+        "key": "cadence_spm",
+        "type": "number",
+        "unit": "spm",
+        "label": "Cadence"
+      }
+    ]
+  }
+]
