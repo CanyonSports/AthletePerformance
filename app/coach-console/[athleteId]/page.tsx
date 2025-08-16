@@ -2,10 +2,15 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { useParams } from "next/navigation";
+import Link from "next/link";
+import NavBar from "@/components/NavBar";
+import WeekPicker from "@/components/WeekPicker";
+import TemplatesPanel from "@/components/TemplatesPanel";
+import EnduranceEditor from "@/components/EnduranceEditor";
 import * as Supa from "@/lib/supabaseClient";
-import * as NavMod from "@/components/NavBar";
-const NavBar: any = (NavMod as any).default ?? (NavMod as any).NavBar ?? (() => null);
+
+type Sport = "climbing" | "ski" | "mtb" | "running";
 
 type Profile = {
   id: string;
@@ -15,10 +20,10 @@ type Profile = {
 };
 
 type PlanItem = {
-  id?: string;
+  id: string;
   user_id: string;
-  sport: "climbing" | "ski" | "mtb" | "running";
-  session_date: string; // yyyy-mm-dd
+  sport: Sport;
+  session_date: string; // yyyy-mm-dd (local)
   title: string;
   details: string | null;
   duration_min: number | null;
@@ -27,45 +32,36 @@ type PlanItem = {
   created_at?: string;
 };
 
-function startOfWeekISO(d: Date) {
-  const x = new Date(d);
-  const day = (x.getDay() + 6) % 7;
-  x.setDate(x.getDate() - day);
-  x.setHours(0, 0, 0, 0);
-  return x.toISOString().slice(0, 10);
+/* ---------- Local date helpers (avoid UTC drift) ---------- */
+function ymd(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function fromYMD(iso: string) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, (m ?? 1) - 1, d ?? 1, 12, 0, 0, 0);
 }
 function addDaysISO(iso: string, days: number) {
-  const d = new Date(iso);
+  const d = fromYMD(iso);
   d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
+  return ymd(d);
 }
-const dayNames = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
-function indexToISO(weekStartISO: string, idx: number) { return addDaysISO(weekStartISO, idx); }
-
-function InlineWeekPicker({
-  value, onChange, className,
-}: { value: string; onChange: (v: string) => void; className?: string; }) {
-  const prev = () => onChange(addDaysISO(value, -7));
-  const next = () => onChange(addDaysISO(value, +7));
-  const handleDate = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const v = e.target.value ? new Date(e.target.value) : new Date();
-    onChange(startOfWeekISO(v));
-  };
-  return (
-    <div className={`flex items-center gap-2 ${className ?? ""}`}>
-      <button className="btn btn-dark" type="button" onClick={prev}>←</button>
-      <input type="date" className="field field--date" value={value} onChange={handleDate} />
-      <button className="btn btn-dark" type="button" onClick={next}>→</button>
-      <span className="text-sm" style={{ color: "var(--muted)" }}>{value} – {addDaysISO(value, 6)}</span>
-    </div>
-  );
+function startOfWeekISO_local(d: Date) {
+  const copy = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const day = (copy.getDay() + 6) % 7; // Monday=0
+  copy.setDate(copy.getDate() - day);
+  return ymd(copy);
+}
+function weekdayLabel(iso: string) {
+  return fromYMD(iso).toLocaleDateString(undefined, { weekday: "long" });
 }
 
-export default function CoachAthleteBuilderPage() {
-  const router = useRouter();
-  const params = useParams<{ athleteId: string }>();
-  const sp = useSearchParams();
+export default function CoachAthleteConsolePage() {
+  const { athleteId } = useParams<{ athleteId: string }>();
 
+  // Supabase (supports either getSupabase() or supabase export)
   const supabase = useMemo(() => {
     const anyS = Supa as any;
     try { if (typeof anyS.getSupabase === "function") return anyS.getSupabase(); } catch {}
@@ -74,298 +70,412 @@ export default function CoachAthleteBuilderPage() {
   }, []);
   const isConfigured = Boolean(supabase);
 
-  const athleteId = params?.athleteId as string;
+  const [note, setNote] = useState("");
   const [me, setMe] = useState<Profile | null>(null);
   const [athlete, setAthlete] = useState<Profile | null>(null);
-  const [note, setNote] = useState("");
+  const [authorized, setAuthorized] = useState<boolean>(false);
 
-  const [sport, setSport] = useState<PlanItem["sport"]>((sp?.get("sport") as any) || "climbing");
-  const [weekStart, setWeekStart] = useState<string>(sp?.get("week") || startOfWeekISO(new Date()));
+  const [sport, setSport] = useState<Sport>("climbing");
+  const [weekStart, setWeekStart] = useState<string>(startOfWeekISO_local(new Date()));
+  const [items, setItems] = useState<PlanItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [newDate, setNewDate] = useState<string>(weekStart);
 
-  const [existing, setExisting] = useState<PlanItem[]>([]);
-  const [loadingExisting, setLoadingExisting] = useState(false);
+  // NEW: tab to switch read-only sessions vs editable builder
+  const [activeTab, setActiveTab] = useState<"sessions" | "builder">("sessions");
 
-  const emptySession = (d: string): Omit<PlanItem,"user_id"|"sport"|"status"> => ({
-    session_date: d,
-    title: "",
-    details: "",
-    duration_min: null,
-    rpe: null,
-  });
-  const [draft, setDraft] = useState<Array<Omit<PlanItem,"user_id"|"sport"|"status">>>([
-    emptySession(weekStart),
-  ]);
+  // NEW: per-day drafts for quick add { [iso]: { title, details } }
+  const [drafts, setDrafts] = useState<Record<string, { title: string; details: string }>>({});
 
-  const loadProfiles = useCallback(async () => {
+  /* ---------- Load coach + athlete + authorization ---------- */
+  const loadWho = useCallback(async () => {
     setNote("");
     if (!isConfigured || !supabase) return;
+
     try {
-      const { data: { user }, error: userErr } = await supabase.auth.getUser();
-      if (userErr) throw userErr;
+      const { data: { user } } = await supabase.auth.getUser();
       if (!user) { setNote("Please sign in."); return; }
 
-      const { data: meRow, error: meErr } = await supabase
-        .from("profiles").select("*").eq("id", user.id).single();
-      if (meErr) throw meErr;
-      setMe(meRow as Profile);
+      const meRes = await supabase.from("profiles").select("*").eq("id", user.id).single();
+      if (meRes.error) throw meRes.error;
+      setMe(meRes.data as Profile);
 
-      const { data: link, error: linkErr } = await supabase
-        .from("coach_athletes")
-        .select("athlete_id")
-        .eq("coach_id", user.id)
-        .eq("athlete_id", athleteId)
-        .maybeSingle();
-      if (linkErr) throw linkErr;
-      if (!link) setNote("You are not linked to this athlete.");
+      const aRes = await supabase.from("profiles").select("*").eq("id", athleteId).single();
+      if (aRes.error) throw aRes.error;
+      setAthlete(aRes.data as Profile);
 
-      const { data: aRow, error: aErr } = await supabase
-        .from("profiles").select("*").eq("id", athleteId).single();
-      if (aErr) throw aErr;
-      setAthlete(aRow as Profile);
+      let ok = (meRes.data?.role === "coach" || meRes.data?.role === "admin");
+      if (ok && meRes.data?.role === "coach") {
+        const linkRes = await supabase
+          .from("coach_athletes")
+          .select("id")
+          .eq("coach_id", user.id)
+          .eq("athlete_id", athleteId)
+          .maybeSingle();
+        ok = Boolean(linkRes.data);
+      }
+      setAuthorized(ok);
+      if (!ok) setNote("You are not linked to this athlete.");
     } catch (e: any) {
       setNote(e.message ?? String(e));
     }
   }, [isConfigured, supabase, athleteId]);
 
-  const loadExistingWeek = useCallback(async () => {
+  useEffect(() => { loadWho(); }, [loadWho]);
+
+  /* ---------- Load week sessions ---------- */
+  const loadWeek = useCallback(async () => {
     if (!isConfigured || !supabase || !athleteId) return;
-    setLoadingExisting(true);
+    setLoading(true);
     try {
       const end = addDaysISO(weekStart, 7);
       const { data, error } = await supabase
         .from("training_plan_items")
         .select("*")
         .eq("user_id", athleteId)
-        .eq("sport", sport)
         .gte("session_date", weekStart)
         .lt("session_date", end)
-        .order("session_date",{ ascending: true });
+        .order("session_date", { ascending: true });
       if (error) throw error;
-      setExisting((data || []) as PlanItem[]);
+      setItems((data || []) as PlanItem[]);
+      if (newDate < weekStart || newDate >= end) setNewDate(weekStart);
     } catch (e: any) {
       setNote(e.message ?? String(e));
-    } finally { setLoadingExisting(false); }
-  }, [isConfigured, supabase, athleteId, sport, weekStart]);
+    } finally {
+      setLoading(false);
+    }
+  }, [isConfigured, supabase, athleteId, weekStart, newDate]);
 
-  useEffect(() => { loadProfiles(); }, [loadProfiles]);
-  useEffect(() => { loadExistingWeek(); }, [loadExistingWeek]);
+  useEffect(() => { loadWeek(); }, [loadWeek]);
 
+  /* ---------- Realtime refresh ---------- */
   useEffect(() => {
     if (!isConfigured || !supabase || !athleteId) return;
     let mounted = true;
-    let channel: any = null;
-    (async () => {
-      try {
-        channel = supabase.channel(`coach-plan-${athleteId}`)
-          .on("postgres_changes", { event: "*", schema: "public", table: "training_plan_items", filter: `user_id=eq.${athleteId}` },
-            () => { if (mounted) loadExistingWeek(); })
-          .subscribe();
-      } catch {}
-    })();
+    const channel = supabase
+      .channel(`coach-week-${athleteId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "training_plan_items", filter: `user_id=eq.${athleteId}` },
+        () => { if (mounted) loadWeek(); }
+      )
+      .subscribe();
     return () => {
       mounted = false;
-      try { if (channel) { supabase.removeChannel(channel); channel?.unsubscribe?.(); } } catch {}
+      try { supabase.removeChannel(channel); channel?.unsubscribe?.(); } catch {}
     };
-  }, [isConfigured, supabase, athleteId, loadExistingWeek]);
+  }, [isConfigured, supabase, athleteId, loadWeek]);
 
-  function addDraftSession(dayIdx?: number) {
-    const day = typeof dayIdx === "number" ? indexToISO(weekStart, dayIdx) : weekStart;
-    setDraft(d => [...d, emptySession(day)]);
-  }
-  function removeDraftSession(i: number) { setDraft(d => d.filter((_, idx) => idx !== i)); }
-  function patchDraft(i: number, patch: Partial<Omit<PlanItem,"user_id"|"sport"|"status">>) {
-    setDraft(d => d.map((row, idx) => idx === i ? { ...row, ...patch } : row));
-  }
-
-  async function publish(mode: "replace" | "append") {
-    setNote("");
-    if (!isConfigured || !supabase) return;
-    if (!athleteId) { setNote("Missing athlete id."); return; }
-
-    const rows = draft.map(r => ({ ...r, title: (r.title || "").trim() })).filter(r => r.title.length > 0);
-    if (rows.length === 0) { setNote("Nothing to publish. Add at least one titled session."); return; }
-
-    const end = addDaysISO(weekStart, 7);
+  /* ---------- Mutations ---------- */
+  async function linkMeToAthlete() {
+    if (!isConfigured || !supabase || !athleteId) return;
     try {
-      if (mode === "replace") {
-        const { error: delErr } = await supabase
-          .from("training_plan_items")
-          .delete()
-          .eq("user_id", athleteId)
-          .eq("sport", sport)
-          .gte("session_date", weekStart)
-          .lt("session_date", end);
-        if (delErr) throw delErr;
-      }
-
-      const payload: PlanItem[] = rows.map(r => ({
-        user_id: athleteId,
-        sport,
-        session_date: r.session_date || weekStart,
-        title: r.title,
-        details: (r.details ?? "") || null,
-        duration_min: (r.duration_min ?? null),
-        rpe: (r.rpe ?? null),
-        status: "planned",
-      }));
-      const { error: insErr } = await supabase.from("training_plan_items").insert(payload as any);
-      if (insErr) throw insErr;
-
-      setNote(mode === "replace" ? "Published: replaced this week." : "Published: appended to this week.");
-      setDraft([emptySession(weekStart)]);
-      await loadExistingWeek();
-    } catch (e: any) {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error("Sign in required");
+      const { error } = await supabase
+        .from("coach_athletes")
+        .insert({ coach_id: user.id, athlete_id: athleteId });
+      if (error) throw error;
+      setAuthorized(true);
+      setNote("Linked! You now manage this athlete.");
+    } catch (e:any) {
       setNote(e.message ?? String(e));
     }
   }
 
-  const athleteLabel = athlete?.display_name || athlete?.email || athleteId;
-  const guard =
-    !me ? "Loading profile…" :
-    (me.role === "coach" || me.role === "admin") ? "" :
-    "You are not a coach. Ask an admin to set your role.";
+  async function addSessionOn(dateISO: string, title: string, details: string) {
+    if (!isConfigured || !supabase || !athleteId) return;
+    const row: Omit<PlanItem, "id"> = {
+      user_id: athleteId,
+      sport,
+      session_date: dateISO,
+      title: title || "New Session",
+      details: details || "",
+      duration_min: null,
+      rpe: null,
+      status: "planned",
+    };
+    const { error } = await supabase.from("training_plan_items").insert(row as any);
+    if (error) setNote(error.message);
+    else await loadWeek();
+  }
 
+  async function updateField(id: string, patch: Partial<PlanItem>) {
+    if (!isConfigured || !supabase) return;
+    const { error } = await supabase.from("training_plan_items").update(patch).eq("id", id);
+    if (error) setNote(error.message);
+  }
+  async function deleteSession(id: string) {
+    if (!isConfigured || !supabase) return;
+    const { error } = await supabase.from("training_plan_items").delete().eq("id", id);
+    if (error) setNote(error.message);
+  }
+
+  /* ---------- Derived ---------- */
+  const headerName = athlete?.display_name || athlete?.email || "(Athlete)";
+  const weekDays = Array.from({ length: 7 }, (_, i) => addDaysISO(weekStart, i));
+  const sessionsByDay = (iso: string) => items.filter(it => it.session_date === iso);
+
+  /* ---------- UI ---------- */
   return (
-    <div className="max-w-6xl mx-auto pb-16">
+    <div className="max-w-7xl mx-auto pb-20">
       <NavBar />
 
-      <div className="card p-4 mt-6">
-        <div className="flex items-center gap-3" style={{ flexWrap: "wrap" }}>
+      {/* Sticky header */}
+      <div className="card p-4" style={{ position: "sticky", top: 0, zIndex: 20, backdropFilter: "blur(6px)", background: "rgba(0,0,0,0.6)" }}>
+        <div className="flex items-center gap-3" style={{flexWrap:"wrap"}}>
+          <Link href="/coach" className="btn">← Back</Link>
+          <div className="avatar">{(headerName || "?").slice(0,1).toUpperCase()}</div>
           <div>
-            <h2 className="text-xl font-semibold">Program Builder</h2>
-            <p className="text-sm" style={{ color: "var(--muted)" }}>
-              Athlete: <strong>{athleteLabel}</strong>
-            </p>
-            {guard ? <p className="text-xs" style={{ color: "#fca5a5", marginTop: 6 }}>{guard}</p> : null}
-            {note ? <p className="text-xs" style={{ color: "#fca5a5", marginTop: 6 }}>{note}</p> : null}
+            <div className="text-xs" style={{ color: "var(--muted)" }}>Coach Console</div>
+            <h1 className="text-xl font-semibold">{headerName}</h1>
           </div>
-
-          <div className="ml-auto flex items-center gap-2">
-            {/* 👇 back now returns to /coach-console */}
-            <button className="btn btn-dark" type="button" onClick={() => router.push("/coach-console")}>← Back</button>
-
-            <select className="field" value={sport} onChange={e => setSport(e.target.value as any)}>
+          <div className="ml-auto flex items-center gap-3">
+            <WeekPicker value={weekStart} onChange={(v) => setWeekStart(v)} />
+            <select
+              className="px-3 py-2 rounded bg-white/5 border border-white/10"
+              value={sport}
+              onChange={(e) => setSport(e.target.value as Sport)}
+              title="Sport context for new sessions"
+            >
               <option value="climbing">Climbing</option>
               <option value="ski">Ski</option>
               <option value="mtb">MTB</option>
               <option value="running">Running</option>
             </select>
-
-            <InlineWeekPicker value={weekStart} onChange={setWeekStart} />
           </div>
         </div>
-      </div>
 
-      <div className="grid grid-2 mt-6 gap-4">
-        {/* LEFT: Builder */}
-        <div className="card p-4">
-          <div className="flex items-center gap-2">
-            <h3 className="text-lg font-semibold">Build This Week</h3>
-            <span className="ml-auto text-xs" style={{ color: "var(--muted)" }}>
-              Click “Publish” to push to athlete
+        {note ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{note}</div> : null}
+        {me && (me.role === "coach" || me.role === "admin") && !authorized ? (
+          <div className="mt-2">
+            <button className="btn btn-dark" onClick={linkMeToAthlete}>Link me to this athlete</button>
+            <span className="text-xs ml-3" style={{ color: "var(--muted)" }}>
+              Creates a coach_athletes link so you can manage this athlete.
             </span>
           </div>
+        ) : null}
+      </div>
 
-          <div className="flex flex-wrap gap-2 mt-3">
-            {dayNames.map((d, i) => (
-              <button key={d} className="btn btn-dark" type="button" onClick={() => addDraftSession(i)}>
-                + {d}
+      {/* Two columns: Left = Templates; Right = Sessions OR Builder */}
+      <div className="mt-4 grid" style={{ gridTemplateColumns: "minmax(280px, 360px) 1fr", gap: 16 }}>
+        {/* LEFT: Templates & quick add (unchanged) */}
+        <aside className="flex flex-col gap-3">
+          <div className="card p-4">
+            <h3 className="font-semibold">Add Session</h3>
+            <p className="text-sm" style={{ color: "var(--muted)" }}>
+              Choose a date and create a new session (uses selected sport).
+            </p>
+            <div className="mt-3 flex items-center gap-2">
+              <input
+                type="date"
+                className="px-3 py-2 rounded bg-white/5 border border-white/10"
+                value={newDate}
+                onChange={(e) => setNewDate(e.target.value || weekStart)}
+              />
+              <button className="btn btn-dark" onClick={() => addSessionOn(newDate, "New Session", "")} disabled={!authorized}>
+                + Add Session
               </button>
-            ))}
-            <button className="btn btn-dark" type="button" onClick={() => addDraftSession()}>
-              + Add Session
-            </button>
+            </div>
           </div>
 
-          <div className="mt-4 flex flex-col gap-3">
-            {draft.map((row, i) => (
-              <div key={i} className="card p-3">
-                <div className="flex items-center gap-2">
-                  <input
-                    type="date"
-                    className="field field--date"
-                    value={row.session_date}
-                    onChange={e => patchDraft(i, { session_date: e.target.value })}
-                  />
-                  <input
-                    className="field flex-1"
-                    placeholder="Session title (e.g., Limit Boulders 4x4)"
-                    value={row.title}
-                    onChange={e => patchDraft(i, { title: e.target.value })}
-                  />
-                  <button className="btn btn-dark" type="button" onClick={() => removeDraftSession(i)}>Delete</button>
-                </div>
-                <textarea
-                  className="field w-full mt-2"
-                  rows={3}
-                  placeholder="Details / prescription"
-                  value={row.details ?? ""}
-                  onChange={e => patchDraft(i, { details: e.target.value })}
-                />
-                <div className="flex gap-3 mt-2">
-                  <input
-                    type="number"
-                    className="field w-32"
-                    placeholder="Duration (min)"
-                    value={row.duration_min ?? ""}
-                    onChange={e => patchDraft(i, { duration_min: e.target.value === "" ? null : Number(e.target.value) })}
-                  />
-                  <input
-                    type="number"
-                    className="field w-24"
-                    placeholder="RPE"
-                    value={row.rpe ?? ""}
-                    onChange={e => patchDraft(i, { rpe: e.target.value === "" ? null : Number(e.target.value) })}
-                  />
-                </div>
+          <TemplatesPanel
+            athleteId={athleteId}
+            sport={sport}
+            weekStart={weekStart}
+            onApplied={() => loadWeek()}
+          />
+        </aside>
+
+        {/* RIGHT: Tabs */}
+        <main className="flex flex-col gap-3">
+          {/* Tab switcher */}
+          <div className="card p-3">
+            <div className="tabs">
+              <button
+                className={`tab ${activeTab === "sessions" ? "tab-active" : ""}`}
+                onClick={() => setActiveTab("sessions")}
+              >
+                Week Sessions
+              </button>
+              <button
+                className={`tab ${activeTab === "builder" ? "tab-active" : ""}`}
+                onClick={() => setActiveTab("builder")}
+              >
+                Builder
+              </button>
+            </div>
+          </div>
+
+          {/* Tab: READ-ONLY Week Sessions */}
+          {activeTab === "sessions" ? (
+            <div className="card p-4">
+              <div className="flex items-center gap-2">
+                <h2 className="text-lg font-semibold">Week Sessions</h2>
+                {loading ? <span className="text-xs" style={{ color: "var(--muted)" }}>Loading…</span> : null}
+                <span className="ml-auto text-sm" style={{ color: "var(--muted)" }}>
+                  Week of {new Date(fromYMD(weekStart)).toLocaleDateString()}
+                </span>
               </div>
-            ))}
-            {draft.length === 0 && (
-              <div className="text-sm" style={{ color: "var(--muted)" }}>
-                No draft sessions yet. Use the buttons above to add.
+
+              <div className="mt-3 space-y-4">
+                {weekDays.map(day => {
+                  const list = sessionsByDay(day);
+                  return (
+                    <div key={day}>
+                      <div className="text-sm font-semibold">
+                        {weekdayLabel(day)} • {new Date(fromYMD(day)).toLocaleDateString()}
+                      </div>
+
+                      {list.length === 0 ? (
+                        <div className="text-sm mt-1" style={{ color: "var(--muted)" }}>No sessions.</div>
+                      ) : (
+                        <div className="mt-2 grid" style={{ gap: 8 }}>
+                          {list.map(it => (
+                            <div key={it.id} className="card p-3">
+                              <div className="flex items-center gap-2">
+                                <div className="font-semibold">{it.title || "(Untitled session)"}</div>
+                                <div className="ml-auto flex gap-2">
+                                  <Link className="btn" href={`/coach-console/${athleteId}/session/${it.id}`}>Edit</Link>
+                                  <button className="btn btn-dark" onClick={() => deleteSession(it.id)}>Delete</button>
+                                </div>
+                              </div>
+                              {it.details ? (
+                                <div className="text-sm mt-1" style={{ color: "var(--muted)" }}>
+                                  {it.details}
+                                </div>
+                              ) : (
+                                <div className="text-sm mt-1" style={{ color: "var(--muted)" }}>
+                                  (No description)
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
-            )}
-          </div>
-
-          <div className="mt-4 flex flex-wrap gap-2">
-            <button className="btn btn-dark" type="button" onClick={() => publish("replace")}>
-              Publish — Replace This Week
-            </button>
-            <button className="btn btn-dark" type="button" onClick={() => publish("append")}>
-              Publish — Append
-            </button>
-          </div>
-        </div>
-
-        {/* RIGHT: Existing plan preview */}
-        <div className="card p-4">
-          <h3 className="text-lg font-semibold">This Week (Saved)</h3>
-          {loadingExisting ? (
-            <div className="mt-3">Loading…</div>
-          ) : existing.length === 0 ? (
-            <div className="mt-3" style={{ color: "var(--muted)" }}>
-              No sessions saved for this week.
             </div>
           ) : (
-            <div className="mt-4 flex flex-col gap-3">
-              {existing.map(it => (
-                <div key={it.id} className="card p-3">
-                  <div className="flex items-center gap-2">
-                    <span className="badge">{new Date(it.session_date).toLocaleDateString()}</span>
-                    <span className="font-medium">{it.title}</span>
-                    <span className="ml-auto text-xs" style={{ color: "var(--muted)" }}>
-                      {it.status}
-                    </span>
-                  </div>
-                  {it.details && <div className="text-sm mt-1 whitespace-pre-wrap">{it.details}</div>}
-                  <div className="text-xs mt-2" style={{ color: "var(--muted)" }}>
-                    {it.duration_min != null ? `${it.duration_min} min` : "—"} · RPE {it.rpe ?? "—"}
-                  </div>
-                </div>
-              ))}
+            // Tab: EDITABLE BUILDER VIEW (now WITH per-day quick-add)
+            <div className="card p-4">
+              <h3 className="font-semibold">Builder</h3>
+              <p className="text-sm" style={{ color: "var(--muted)" }}>
+                Edit existing sessions or add new ones. Changes save instantly.
+              </p>
+
+              <div className="mt-3 space-y-6">
+                {weekDays.map(day => {
+                  const list = sessionsByDay(day);
+                  const draft = drafts[day] || { title: "", details: "" };
+                  return (
+                    <div key={day}>
+                      <div className="flex items-center gap-2">
+                        <div className="text-sm font-semibold">
+                          {weekdayLabel(day)} • {new Date(fromYMD(day)).toLocaleDateString()}
+                        </div>
+                        <div className="ml-auto text-xs" style={{ color: "var(--muted)" }}>{day}</div>
+                      </div>
+
+                      {/* Per-day quick add (title + description) */}
+                      <div className="mt-2 card p-3">
+                        <div className="grid" style={{ gap: 8 }}>
+                          <input
+                            className="w-full px-3 py-2 rounded bg-white/5 border border-white/10"
+                            placeholder="New session title"
+                            value={draft.title}
+                            onChange={(e) =>
+                              setDrafts((d) => ({ ...d, [day]: { ...draft, title: e.target.value } }))
+                            }
+                          />
+                          <textarea
+                            className="w-full px-3 py-2 rounded bg-white/5 border border-white/10"
+                            placeholder="Description / intent (optional)"
+                            rows={2}
+                            value={draft.details}
+                            onChange={(e) =>
+                              setDrafts((d) => ({ ...d, [day]: { ...draft, details: e.target.value } }))
+                            }
+                          />
+                          <div className="flex gap-2">
+                            <button
+                              className="btn btn-dark"
+                              onClick={() => {
+                                addSessionOn(day, draft.title.trim(), draft.details.trim());
+                                setDrafts((d) => ({ ...d, [day]: { title: "", details: "" } }));
+                              }}
+                              disabled={!authorized || draft.title.trim().length === 0}
+                            >
+                              + Add to {weekdayLabel(day)}
+                            </button>
+                            {/* Optional: clear */}
+                            {(draft.title || draft.details) ? (
+                              <button
+                                className="btn"
+                                onClick={() => setDrafts((d) => ({ ...d, [day]: { title: "", details: "" } }))}
+                              >
+                                Clear
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Existing sessions (editable + Edit link) */}
+                      {list.length === 0 ? (
+                        <div className="text-sm mt-2" style={{ color: "var(--muted)" }}>No sessions yet.</div>
+                      ) : (
+                        <div className="mt-2 grid" style={{ gap: 8 }}>
+                          {list.map(it => (
+                            <div key={it.id} className="card p-3">
+                              <div className="flex items-center gap-2" style={{ flexWrap: "wrap" }}>
+                                {/* Move between days */}
+                                <input
+                                  type="date"
+                                  className="px-2 py-1 rounded bg-white/5 border border-white/10"
+                                  value={it.session_date}
+                                  onChange={(e) => updateField(it.id, { session_date: e.target.value })}
+                                />
+                                <div className="ml-auto flex items-center gap-2">
+                                  <Link className="btn" href={`/coach-console/${athleteId}/session/${it.id}`}>Edit</Link>
+                                  <button className="btn btn-dark" onClick={() => deleteSession(it.id)}>Delete</button>
+                                </div>
+                              </div>
+
+                              {/* Editable title & description */}
+                              <input
+                                className="w-full mt-3 px-3 py-2 rounded bg-white/5 border border-white/10"
+                                placeholder="Title"
+                                value={it.title || ""}
+                                onChange={(e) => updateField(it.id, { title: e.target.value })}
+                              />
+                              <textarea
+                                className="w-full mt-2 px-3 py-2 rounded bg-white/5 border border-white/10"
+                                placeholder="Details / intent"
+                                rows={3}
+                                value={it.details ?? ""}
+                                onChange={(e) => updateField(it.id, { details: e.target.value })}
+                              />
+
+                              {/* Endurance intervals editor for endurance sports */}
+                              {(it.sport === "running" || it.sport === "mtb" || it.sport === "ski") ? (
+                                <div className="mt-3">
+                                  <EnduranceEditor planItemId={it.id} athleteId={it.user_id} />
+                                </div>
+                              ) : null}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           )}
-        </div>
+        </main>
       </div>
     </div>
   );

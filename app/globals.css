@@ -43,3 +43,22 @@ input[type="date"].field { appearance: auto; }
 
 /* Make textareas tall enough to write comfortably */
 textarea.field { min-height: 110px; }
+
+.tabs { display: flex; gap: 8px; }
+.tab {
+  padding: 8px 12px; border-radius: 999px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.1);
+  font-size: 14px;
+}
+.tab:hover { border-color: rgba(255,255,255,0.25); }
+.tab-active {
+  background: #e11d48; /* Canyon red */
+  border-color: #e11d48; color: #fff;
+}
+.avatar {
+  width: 36px; height: 36px; border-radius: 999px;
+  display: grid; place-items: center;
+  background: #1f2937; color: #fff; font-weight: 700;
+  border: 1px solid rgba(255,255,255,0.08);
+}
