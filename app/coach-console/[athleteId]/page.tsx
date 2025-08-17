@@ -370,6 +370,7 @@ export default function CoachAthleteConsolePage() {
             {addError ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{addError}</div> : null}
           </div>
 
+
         </aside>
 
         {/* RIGHT */}

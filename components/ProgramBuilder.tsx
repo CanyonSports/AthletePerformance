@@ -1,254 +1,209 @@
 // components/ProgramBuilder.tsx
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
 import * as Supa from "@/lib/supabaseClient";
+import EnduranceEditor from "@/components/EnduranceEditor";
 
-export type Sport = "climbing" | "ski" | "mtb" | "running";
-
-type DaySession = {
+/** Minimal shape of your plan item row */
+type PlanItem = {
+  id: string;
+  user_id: string;
+  session_date: string; // yyyy-mm-dd
   title: string;
-  details: string;
-  duration_min: string; // keep as string for empty state; cast on save
-  rpe: string;          // keep as string for empty state; cast on save
+  details: string | null;
+  duration_min: number | null;
+  rpe: number | null;
+  status: "planned" | "completed" | "skipped";
+  created_at?: string;
 };
 
-type ProgramBuilderProps = {
-  sport: Sport;
-  weekStart: string;       // yyyy-mm-dd (Monday)
-  athleteId: string | null;
-  onPushed?: (count: number) => void; // callback after pushing sessions
-};
-
-function addDaysISO(baseISO: string, days: number) {
-  const d = new Date(baseISO);
-  d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
+function ymd(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function fromYMD(iso: string) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, (m ?? 1) - 1, d ?? 1, 12, 0, 0, 0);
 }
 
-const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+type Props = {
+  athleteId: string;
+  /** Use "new" to create a brand-new session then auto-route to its id */
+  planItemId: string; // id | "new"
+  initialDate?: string; // optional when planItemId === "new"
+};
 
-export default function ProgramBuilder({
-  sport,
-  weekStart,
-  athleteId,
-  onPushed,
-}: ProgramBuilderProps) {
-  // Support either exported getSupabase() or supabase constant.
+export default function ProgramBuilder({ athleteId, planItemId, initialDate }: Props) {
+  const router = useRouter();
+
+  // Supabase: works with either getSupabase() or exported supabase
   const supabase = useMemo(() => {
     const anyS = Supa as any;
-    try {
-      if (typeof anyS.getSupabase === "function") return anyS.getSupabase();
-    } catch {}
+    try { if (typeof anyS.getSupabase === "function") return anyS.getSupabase(); } catch {}
     if (anyS.supabase) return anyS.supabase;
     return null;
   }, []);
 
-  // sessions state: dayIndex -> sessions[]
-  const [sessions, setSessions] = useState<Record<number, DaySession[]>>({
-    0: [],
-    1: [],
-    2: [],
-    3: [],
-    4: [],
-    5: [],
-    6: [],
-  });
-  const [clearExisting, setClearExisting] = useState(false);
-  const [status, setStatus] = useState("");
+  const [item, setItem] = useState<PlanItem | null>(null);
+  const [status, setStatus] = useState<string>("");
+  const [fatal, setFatal] = useState<string>("");
 
-  const addSession = (day: number) =>
-    setSessions((prev) => ({
-      ...prev,
-      [day]: [
-        ...(prev[day] || []),
-        { title: "", details: "", duration_min: "", rpe: "" },
-      ],
-    }));
-
-  const removeSession = (day: number, idx: number) =>
-    setSessions((prev) => ({
-      ...prev,
-      [day]: (prev[day] || []).filter((_, i) => i !== idx),
-    }));
-
-  const setField = (day: number, idx: number, patch: Partial<DaySession>) =>
-    setSessions((prev) => ({
-      ...prev,
-      [day]: (prev[day] || []).map((s, i) =>
-        i === idx ? { ...s, ...patch } : s
-      ),
-    }));
-
-  async function pushToAthlete() {
-    setStatus("Pushing…");
+  const loadItem = useCallback(async (id: string) => {
+    if (!supabase) return;
+    setStatus("Loading…");
     try {
-      if (!supabase) throw new Error("Supabase not configured");
-      if (!athleteId) throw new Error("Select an athlete first");
+      const { data, error } = await supabase
+        .from("training_plan_items")
+        .select("*")
+        .eq("id", id)
+        .eq("user_id", athleteId)
+        .single();
+      if (error) throw error;
+      setItem(data as PlanItem);
+      setStatus("");
+    } catch (e:any) {
+      setStatus("");
+      setFatal(e.message ?? String(e));
+    }
+  }, [supabase, athleteId]);
 
-      // Optional: clear existing week for this sport
-      if (clearExisting) {
-        const end = addDaysISO(weekStart, 7);
-        const { error: delErr } = await supabase
-          .from("training_plan_items")
-          .delete()
-          .eq("user_id", athleteId)
-          .eq("sport", sport)
-          .gte("session_date", weekStart)
-          .lt("session_date", end);
-        if (delErr) throw delErr;
-      }
-
-      // Build inserts
-      const rows: any[] = [];
-      for (let day = 0; day < 7; day++) {
-        const date = addDaysISO(weekStart, day);
-        for (const s of sessions[day] || []) {
-          if (!s.title.trim()) continue; // skip empty
-          rows.push({
-            user_id: athleteId,
-            sport,
-            session_date: date,
-            title: s.title.trim(),
-            details: s.details.trim() || null,
-            duration_min: s.duration_min === "" ? null : Number(s.duration_min),
-            rpe: s.rpe === "" ? null : Number(s.rpe),
-            status: "planned",
-          });
-        }
-      }
-
-      if (rows.length === 0) {
-        setStatus("Add at least one session before pushing.");
+  // Create on the fly if planItemId === "new"
+  useEffect(() => {
+    (async () => {
+      if (!supabase) { setFatal("Supabase not configured."); return; }
+      if (planItemId !== "new") {
+        loadItem(planItemId);
         return;
       }
+      try {
+        setStatus("Creating session…");
+        const { data, error } = await supabase
+          .from("training_plan_items")
+          .insert({
+            user_id: athleteId,
+            session_date: initialDate || ymd(),
+            title: "New Session",
+            details: "",
+            duration_min: null,
+            rpe: null,
+            status: "planned",
+          })
+          .select("*")
+          .single();
+        if (error) throw error;
+        // Redirect to the real id route so refresh works nicely
+        router.replace(`/coach-console/${athleteId}/session/${data.id}/edit`);
+        setItem(data as PlanItem);
+        setStatus("");
+      } catch (e:any) {
+        setStatus("");
+        setFatal(e.message ?? String(e));
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [supabase, planItemId, athleteId, initialDate]);
 
-      const { error: insErr } = await supabase
-        .from("training_plan_items")
-        .insert(rows);
-      if (insErr) throw insErr;
+  async function patch(patch: Partial<PlanItem>) {
+    if (!supabase || !item) return;
+    const prev = item;
+    setItem({ ...item, ...patch });
+    setStatus("Saving…");
+    const { error } = await supabase
+      .from("training_plan_items")
+      .update(patch)
+      .eq("id", prev.id);
+    setStatus(error ? (error.message ?? String(error)) : "Saved");
+    if (error) setItem(prev); // revert on failure
+    // Clear "Saved" after a moment
+    if (!error) setTimeout(() => setStatus(""), 700);
+  }
 
-      setStatus(
-        `Pushed ${rows.length} session${rows.length > 1 ? "s" : ""}.`
-      );
-      onPushed?.(rows.length);
-    } catch (e: any) {
-      setStatus(e.message ?? String(e));
-    }
+  async function del() {
+    if (!supabase || !item) return;
+    if (!confirm("Delete this session? This cannot be undone.")) return;
+    setStatus("Deleting…");
+    const { error } = await supabase.from("training_plan_items").delete().eq("id", item.id);
+    if (error) { setStatus(error.message ?? String(error)); return; }
+    router.push(`/coach-console/${athleteId}`);
+  }
+
+  if (fatal) {
+    return (
+      <div className="max-w-4xl mx-auto p-6">
+        <div className="card p-4">
+          <p className="text-red-400 text-sm">{fatal}</p>
+          <Link href={`/coach-console/${athleteId}`} className="btn mt-3">← Back</Link>
+        </div>
+      </div>
+    );
+  }
+  if (!item) {
+    return (
+      <div className="max-w-4xl mx-auto p-6">
+        <div className="card p-4">Loading…</div>
+      </div>
+    );
   }
 
   return (
-    <div className="card p-4 mt-6">
-      <div className="flex items-center gap-3" style={{ flexWrap: "wrap" }}>
-        <h3 className="text-lg font-semibold">Exercise Program Builder</h3>
-        <span className="badge" style={{ textTransform: "uppercase" }}>
-          {sport}
-        </span>
-        <span className="badge">Week: {weekStart}</span>
-        <label className="flex items-center gap-2" style={{ marginLeft: "auto" }}>
+    <div className="max-w-5xl mx-auto pb-24">
+      {/* Sticky header */}
+      <div className="card p-4" style={{ position: "sticky", top: 0, zIndex: 20, backdropFilter: "blur(6px)", background: "rgba(0,0,0,0.6)" }}>
+        <div className="flex items-center gap-3" style={{ flexWrap: "wrap" }}>
+          <Link href={`/coach-console/${athleteId}`} className="btn">← Back</Link>
+          <h1 className="text-xl font-semibold">Session Composer</h1>
+          <div className="ml-auto text-sm" style={{ color: "var(--muted)" }}>{status}</div>
+        </div>
+        <div className="mt-3 grid" style={{ gap: 8, gridTemplateColumns: "1fr 180px 140px" }}>
           <input
-            type="checkbox"
-            checked={clearExisting}
-            onChange={(e) => setClearExisting(e.target.checked)}
+            className="px-3 py-2 rounded bg-white/5 border border-white/10"
+            placeholder="Session title"
+            value={item.title || ""}
+            onChange={(e) => patch({ title: e.target.value })}
           />
-          <span className="text-sm" style={{ color: "var(--muted)" }}>
-            Clear existing week first
-          </span>
-        </label>
-        <button
-          className="btn btn-pine"
-          onClick={pushToAthlete}
-          disabled={!athleteId}
-          title={!athleteId ? "Select an athlete" : "Push sessions to athlete"}
-        >
-          Push to Athlete
-        </button>
+          <input
+            type="date"
+            className="px-3 py-2 rounded bg-white/5 border border-white/10"
+            value={item.session_date}
+            onChange={(e) => patch({ session_date: e.target.value })}
+          />
+          <div className="flex gap-2">
+            <select
+              className="px-3 py-2 rounded bg-white/5 border border-white/10"
+              value={item.status}
+              onChange={(e) => patch({ status: e.target.value as PlanItem["status"] })}
+            >
+              <option value="planned">Planned</option>
+              <option value="completed">Completed</option>
+              <option value="skipped">Skipped</option>
+            </select>
+            <button className="btn btn-dark" onClick={del}>Delete</button>
+          </div>
+        </div>
+        <textarea
+          className="w-full mt-3 px-3 py-2 rounded bg-white/5 border border-white/10"
+          placeholder="Description / intent"
+          rows={3}
+          value={item.details ?? ""}
+          onChange={(e) => patch({ details: e.target.value })}
+        />
       </div>
 
-      {status ? (
-        <p className="text-sm mt-2" style={{ color: "var(--muted)" }}>
-          {status}
+      {/* Full-screen workout composer (reuses your structured editor) */}
+      <div className="mt-4 card p-4">
+        <h3 className="font-semibold">Workout Composer</h3>
+        <p className="text-sm" style={{ color: "var(--muted)" }}>
+          Add exercises, set reps & load/RPE, group supersets, and attach demo links.
         </p>
-      ) : null}
 
-      <div className="grid grid-2 mt-4">
-        {DAY_LABELS.map((label, dayIdx) => (
-          <div key={dayIdx} className="card p-3">
-            <div className="flex items-center gap-2">
-              <span className="badge">{label}</span>
-              <span className="text-sm" style={{ color: "var(--muted)" }}>
-                {addDaysISO(weekStart, dayIdx)}
-              </span>
-              <button
-                className="btn btn-dark"
-                style={{ marginLeft: "auto" }}
-                onClick={() => addSession(dayIdx)}
-              >
-                + Add Session
-              </button>
-            </div>
-
-            {(sessions[dayIdx] || []).length === 0 ? (
-              <p className="text-sm mt-2" style={{ color: "var(--muted)" }}>
-                No sessions.
-              </p>
-            ) : (
-              <div className="mt-2" style={{ display: "grid", gap: 8 }}>
-                {(sessions[dayIdx] || []).map((s, i) => (
-                  <div key={i} className="card p-3">
-                    <div className="flex items-center gap-2">
-                      <input
-                        className="field w-full"
-                        placeholder="Session title (e.g., Endurance Intervals)"
-                        value={s.title}
-                        onChange={(e) =>
-                          setField(dayIdx, i, { title: e.target.value })
-                        }
-                      />
-                      <button
-                        className="btn btn-dark"
-                        onClick={() => removeSession(dayIdx, i)}
-                      >
-                        Remove
-                      </button>
-                    </div>
-
-                    <textarea
-                      className="field w-full mt-2"
-                      rows={3}
-                      placeholder="Details (e.g., 5x5 min Z3, 3 min easy between)"
-                      value={s.details}
-                      onChange={(e) =>
-                        setField(dayIdx, i, { details: e.target.value })
-                      }
-                    />
-
-                    <div className="flex items-center gap-3 mt-2">
-                      <input
-                        className="field w-32"
-                        type="number"
-                        placeholder="Duration (min)"
-                        value={s.duration_min}
-                        onChange={(e) =>
-                          setField(dayIdx, i, { duration_min: e.target.value })
-                        }
-                      />
-                      <input
-                        className="field w-24"
-                        type="number"
-                        placeholder="RPE"
-                        value={s.rpe}
-                        onChange={(e) =>
-                          setField(dayIdx, i, { rpe: e.target.value })
-                        }
-                      />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        ))}
+        <div className="mt-3">
+          <EnduranceEditor planItemId={item.id} athleteId={athleteId} />
+        </div>
       </div>
     </div>
   );
