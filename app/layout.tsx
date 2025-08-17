@@ -15,3 +15,12 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     </body></html>
   );
 }
+// dev-only: expose the real unhandled rejection reason
+if (typeof window !== "undefined" && process.env.NODE_ENV === "development") {
+  window.addEventListener("unhandledrejection", (event) => {
+    console.error("Unhandled promise rejection reason:", event.reason);
+  });
+  window.addEventListener("error", (event) => {
+    console.error("Unhandled error:", event.error || event.message);
+  });
+}

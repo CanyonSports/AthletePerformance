@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import NavBar from "@/components/NavBar";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import * as Supa from "@/lib/supabaseClient";
@@ -230,8 +231,10 @@ export default function CoachDashboardPage() {
 
   /* ---------------- Render ---------------- */
   return (
+    
     <div className="max-w-7xl mx-auto pb-16">
       {/* Sticky header */}
+       <NavBar />
       <div
         className="card p-4"
         style={{ position: "sticky", top: 0, zIndex: 20, backdropFilter: "blur(6px)", background: "rgba(0,0,0,0.6)" }}

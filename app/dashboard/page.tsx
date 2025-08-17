@@ -8,9 +8,16 @@ import type { MeasurementRow } from "@/lib/types";
 import { getSupabase } from "@/lib/supabaseClient";
 import { Hand, Dumbbell, Timer, Activity } from "lucide-react";
 import { useRouter } from "next/navigation";
+import dynamic from "next/dynamic";
+
+
+
+const AthleteProfileCard = dynamic(() => import("@/components/AthleteProfileCard"), { ssr: false });
+const AthleteStreaks = dynamic(() => import("@/components/AthleteStreaks"), { ssr: false });
+
 
 export default function Dashboard(){
-  const [sport, setSport] = useState("climbing");
+  const [sport,] = useState("climbing");
   const [rows, setRows] = useState<MeasurementRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [note, setNote] = useState<string>("");
@@ -111,25 +118,10 @@ export default function Dashboard(){
   return (
     <div className="max-w-7xl mx-auto pb-10">
       <NavBar />
-
-      {/* Sport & context */}
-      <div className="mt-6 card p-4 flex flex-wrap items-center gap-3">
-        <div>
-          <p className="text-xs text-slate-400">You’re viewing</p>
-          <h2 className="text-2xl font-semibold leading-tight">Performance — <span className="text-csp-white">{sport.toUpperCase()}</span></h2>
-          {note ? <p className="text-xs text-slate-400 mt-1">{note}</p> : null}
-        </div>
-        <div className="ml-auto flex items-center gap-2">
-          <span className="text-sm text-slate-300">Sport:</span>
-          <select value={sport} onChange={e=>setSport(e.target.value)} className="px-3 py-2 rounded bg-white/5 border border-white/10">
-            <option value="climbing">Climbing</option>
-            <option value="ski">Ski</option>
-            <option value="mtb">MTB</option>
-            <option value="running">Running</option>
-          </select>
-        </div>
-      </div>
-
+<AthleteProfileCard editable title="Your Profile & Health" />
+  <AthleteStreaks />
+     
+ 
       {/* KPIs */}
       <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-5 mt-6">
         {kpis.map(k => {

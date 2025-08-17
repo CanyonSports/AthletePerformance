@@ -7,12 +7,10 @@ import NavBar from "@/components/NavBar";
 import * as Supa from "@/lib/supabaseClient";
 import { CalendarDays, CheckCircle2, MessageSquare, XCircle } from "lucide-react";
 import { errMsg } from "@/lib/err";
-import dynamic from "next/dynamic";
 
 
 
-const AthleteProfileCard = dynamic(() => import("@/components/AthleteProfileCard"), { ssr: false });
-const AthleteStreaks = dynamic(() => import("@/components/AthleteStreaks"), { ssr: false });
+
 
 type Profile = {
   id: string;
@@ -227,10 +225,8 @@ export default function AthleteTrainingPage() {
          <div className="mt-4">
  
  <div className="mt-4">
-  <AthleteProfileCard editable title="Your Profile & Health" />
-</div>
  
-  <AthleteStreaks />
+</div>
 </div>
          
           <div className="ml-auto flex items-center gap-2">
