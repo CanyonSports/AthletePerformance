@@ -1,6 +1,5 @@
-
 "use client";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import NavBar from "@/components/NavBar";
 import KpiCard from "@/components/KpiCard";
 import RecentTable from "@/components/RecentTable";
@@ -24,6 +23,19 @@ export default function Dashboard(){
       const supabase = getSupabase();
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { router.push("/login"); return; }
+
+      // If this user is a coach/admin, send them to the coach overview instead
+      const { data: me, error: meErr } = await supabase
+        .from("profiles")
+        .select("role")
+        .eq("id", user.id)
+        .single();
+      if (meErr) throw meErr;
+      if (me?.role === "coach" || me?.role === "admin") {
+        router.replace("/coach");
+        return; // stop loading athlete data
+      }
+
       const { data, error } = await supabase
         .from("measurements")
         .select("*")
@@ -41,45 +53,51 @@ export default function Dashboard(){
 
   useEffect(() => { fetchRows(); }, [fetchRows]);
 
+  // Realtime: robust subscribe + cleanup (no 'channel.unsubscribe' errors)
   useEffect(() => {
-  let isMounted = true;
-  let channel: any = null;
+    const supabase = getSupabase();
+    let canceled = false;
+    const chRef = { current: null as any }; // RealtimeChannel | null
 
-  (async () => {
-    try {
-      const supabase = getSupabase();
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) return;
+    (async () => {
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) return;
 
-      channel = supabase
-        .channel("csp-measurements")
-        .on("postgres_changes", {
-          event: "*",
-          schema: "public",
-          table: "measurements",
-          filter: `user_id=eq.${user.id}`
-        }, () => { if (isMounted) fetchRows(); })
-        .subscribe();
-    } catch (e) {
-      // optional: console.warn("realtime subscribe failed", e);
-    }
-  })();
+        const ch = supabase
+          .channel("csp-measurements")
+          .on("postgres_changes", {
+            event: "*",
+            schema: "public",
+            table: "measurements",
+            filter: `user_id=eq.${user.id}`
+          }, () => { if (!canceled) fetchRows(); })
+          .subscribe(); // returns the channel object
 
-  return () => {
-    isMounted = false;
-    try {
-      if (channel) {
-        // Preferred for supabase-js v2
-        getSupabase().removeChannel(channel);
-        // Fallback if removeChannel isn't available in your runtime
-        channel?.unsubscribe?.();
+        chRef.current = ch;
+      } catch {
+        // swallow; UI still works without realtime
       }
-    } catch {
-      /* ignore */
-    }
-  };
-}, [fetchRows]);
+    })();
 
+    return () => {
+      canceled = true;
+      try {
+        const ch: any = chRef.current;
+        if (!ch) return;
+        const client: any = supabase as any;
+
+        if (typeof client.removeChannel === "function") {
+          client.removeChannel(ch);
+        } else if (typeof ch.unsubscribe === "function") {
+          ch.unsubscribe();
+        }
+        chRef.current = null;
+      } catch {
+        // ignore cleanup errors
+      }
+    };
+  }, [fetchRows]);
 
   const kpis = useMemo(() => KPI_BY_SPORT[sport] || [], [sport]);
   const labels = rows.map(r => r.test_date ?? "");

@@ -1,10 +1,10 @@
 // components/EnduranceEditor.tsx
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import * as Supa from "@/lib/supabaseClient";
 
-type Interval = {
+export type Interval = {
   id: string;
   user_id: string;
   plan_item_id: string;
@@ -29,13 +29,68 @@ function secondsToHMS(s: number | null) {
   return `${m}:${String(sec).padStart(2, "0")}`;
 }
 function HMSToSeconds(str: string) {
-  const parts = str.trim().split(":").map(x => Number(x));
-  if (parts.some(isNaN)) return 0;
-  if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2];
-  if (parts.length === 2) return parts[0]*60 + parts[1];
+  const parts = str.trim().split(":").map((x) => (x === "" ? NaN : Number(x)));
+  if (parts.some((n) => Number.isNaN(n))) return 0;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
   if (parts.length === 1) return parts[0];
   return 0;
 }
+
+/** Sticky-focus notes field: fully local draft + direct Supabase save (no parent state writes). */
+const NotesField = React.memo(function NotesField({
+  rowId,
+  initial,
+  saveNotes,
+  ariaLabel,
+}: {
+  rowId: string;
+  initial: string;
+  saveNotes: (id: string, text: string) => Promise<void>;
+  ariaLabel: string;
+}) {
+  const [val, setVal] = useState(initial);
+  const [saving, setSaving] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isMounted = useRef(true);
+
+  // Only reset when switching rows
+  useEffect(() => { setVal(initial); }, [rowId]);
+  useEffect(() => () => { isMounted.current = false; }, []);
+
+  const flush = useCallback(async (text: string) => {
+    setSaving(true);
+    try { await saveNotes(rowId, text); } finally {
+      // Keep tiny delay so user sees the state, but never unmounts/loses focus
+      if (isMounted.current) setTimeout(() => setSaving(false), 120);
+    }
+  }, [rowId, saveNotes]);
+
+  return (
+    <div className="mt-2">
+      <textarea
+        className="w-full field"
+        rows={2}
+        placeholder="Notes"
+        value={val}
+        onChange={(e) => {
+          const v = e.target.value;
+          setVal(v);
+          if (timer.current) clearTimeout(timer.current);
+          timer.current = setTimeout(() => flush(v), 700);
+        }}
+        onBlur={(e) => {
+          if (timer.current) clearTimeout(timer.current);
+          flush(e.target.value); // immediate on blur
+        }}
+        autoComplete="off"
+        spellCheck
+        aria-label={ariaLabel}
+      />
+      {saving ? <div className="text-xs opacity-70 mt-1">Saving…</div> : null}
+    </div>
+  );
+});
 
 export default function EnduranceEditor({
   planItemId,
@@ -56,6 +111,38 @@ export default function EnduranceEditor({
   const [rows, setRows] = useState<Interval[]>([]);
   const [loading, setLoading] = useState(false);
 
+  // Draft strings for duration/distance so text doesn’t jump
+  type Draft = { durationStr?: string; distanceStr?: string };
+  const [draft, setDraft] = useState<Record<string, Draft>>({});
+
+  // Debounced patch queue for other fields (not notes)
+  const pending = useRef<Record<string, Partial<Interval>>>({});
+  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function scheduleFlush() {
+    if (flushTimer.current) clearTimeout(flushTimer.current);
+    flushTimer.current = setTimeout(flush, 600);
+  }
+  async function flush() {
+    const work = pending.current;
+    pending.current = {};
+    if (!isConfigured || !supabase) return;
+    const entries = Object.entries(work);
+    if (entries.length === 0) return;
+    try {
+      await Promise.all(entries.map(([id, delta]) => supabase.from("training_intervals").update(delta).eq("id", id)));
+    } catch (e: any) {
+      setNote(e.message ?? String(e));
+    }
+  }
+
+  const saveNotesDirect = useCallback(async (id: string, text: string) => {
+    if (!isConfigured || !supabase) return;
+    // Direct write; DO NOT call setRows here → avoids any parent re-render that could cost focus
+    const { error } = await supabase.from("training_intervals").update({ notes: text }).eq("id", id);
+    if (error) setNote(error.message);
+  }, [isConfigured, supabase]);
+
   async function load() {
     if (!isConfigured || !supabase) return;
     setLoading(true);
@@ -68,20 +155,39 @@ export default function EnduranceEditor({
         .order("order_index", { ascending: true });
       if (error) throw error;
       setRows((data || []) as Interval[]);
-    } catch (e:any) {
+      setDraft({});
+    } catch (e: any) {
       setNote(e.message ?? String(e));
     } finally {
       setLoading(false);
     }
   }
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [planItemId]);
+  useEffect(() => {
+    load();
+    return () => { if (flushTimer.current) clearTimeout(flushTimer.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [planItemId]);
+
+  function sorter(a: Interval, b: Interval) {
+    const blockOrder = (blk: Interval["block"]) => (blk === "warmup" ? 0 : blk === "main" ? 1 : 2);
+    const bo = blockOrder(a.block) - blockOrder(b.block);
+    if (bo !== 0) return bo;
+    return a.order_index - b.order_index;
+  }
+
+  // Optimistic local update + queued DB patch (non-notes)
+  const updateLocal = useCallback((id: string, delta: Partial<Interval>) => {
+    setRows((prev) => prev.map((r) => (r.id === id ? ({ ...r, ...delta } as Interval) : r)).sort(sorter));
+    pending.current[id] = { ...(pending.current[id] || {}), ...delta };
+    scheduleFlush();
+  }, []);
 
   async function addRow(block: Interval["block"]) {
     if (!isConfigured || !supabase) return;
     setNote("");
     try {
-      const oi = (rows.filter(r => r.block === block).slice(-1)[0]?.order_index ?? 0) + 10;
+      const oi = (rows.filter((r) => r.block === block).slice(-1)[0]?.order_index ?? 0) + 10;
       const { data, error } = await supabase
         .from("training_intervals")
         .insert({
@@ -101,27 +207,8 @@ export default function EnduranceEditor({
         .select("*")
         .single();
       if (error) throw error;
-      setRows(prev => [...prev, data as Interval].sort(sorter));
-    } catch (e:any) {
-      setNote(e.message ?? String(e));
-    }
-  }
-
-  function sorter(a: Interval, b: Interval) {
-    const blockOrder = (blk: Interval["block"]) => (blk === "warmup" ? 0 : blk === "main" ? 1 : 2);
-    const bo = blockOrder(a.block) - blockOrder(b.block);
-    if (bo !== 0) return bo;
-    return a.order_index - b.order_index;
-  }
-
-  async function patch(id: string, delta: Partial<Interval>) {
-    if (!isConfigured || !supabase) return;
-    setNote("");
-    try {
-      const { error } = await supabase.from("training_intervals").update(delta).eq("id", id);
-      if (error) throw error;
-      setRows(prev => prev.map(r => (r.id === id ? { ...r, ...delta } as Interval : r)).sort(sorter));
-    } catch (e:any) {
+      setRows((prev) => [...prev, data as Interval].sort(sorter));
+    } catch (e: any) {
       setNote(e.message ?? String(e));
     }
   }
@@ -130,17 +217,32 @@ export default function EnduranceEditor({
     if (!isConfigured || !supabase) return;
     if (!confirm("Delete interval?")) return;
     try {
+      setRows((prev) => prev.filter((r) => r.id !== id)); // optimistic
+      delete pending.current[id];
       const { error } = await supabase.from("training_intervals").delete().eq("id", id);
       if (error) throw error;
-      setRows(prev => prev.filter(r => r.id !== id));
-    } catch (e:any) {
+    } catch (e: any) {
       setNote(e.message ?? String(e));
+      load(); // revert
+    }
+  }
+
+  function targetLabel(r: Interval) {
+    const lo = r.target_low ?? 0;
+    const hi = r.target_high ?? 0;
+    switch (r.target_type) {
+      case "rpe":   return `RPE ${lo}${hi ? `–${hi}` : ""}`;
+      case "hr":    return `${lo}${hi ? `–${hi}` : ""} bpm`;
+      case "power": return `${lo}${hi ? `–${hi}` : ""} W`;
+      case "pace":  return `${lo}${hi ? `–${hi}` : ""} pace`;
+      default:      return "";
     }
   }
 
   function Block({ block }: { block: Interval["block"] }) {
-    const list = rows.filter(r => r.block === block);
+    const list = rows.filter((r) => r.block === block);
     const label = block === "warmup" ? "Warm-up" : block === "main" ? "Main" : "Cool-down";
+
     return (
       <div className="rounded border border-white/10 p-3">
         <div className="flex items-center gap-2">
@@ -152,90 +254,130 @@ export default function EnduranceEditor({
           <div className="text-sm opacity-70 mt-2">No intervals in this block.</div>
         ) : (
           <div className="mt-2 space-y-2">
-            {list.map(r => (
-              <div key={r.id} className="rounded bg-white/5 p-2">
-                <div className="flex items-center gap-2" style={{flexWrap:"wrap"}}>
-                  <input
-                    className="w-20 field"
-                    type="number"
-                    min={1}
-                    value={r.repeats}
-                    onChange={e => patch(r.id, { repeats: Math.max(1, Number(e.target.value || 1)) })}
-                    title="Repeats"
-                  />
-                  <select
-                    className="field"
-                    value={r.mode}
-                    onChange={e => patch(r.id, { mode: e.target.value as any })}
-                  >
-                    <option value="duration">By duration</option>
-                    <option value="distance">By distance</option>
-                  </select>
+            {list.map((r, idx) => {
+              const d = draft[r.id] || {};
+              const durationDisplay = d.durationStr ?? secondsToHMS(r.duration_sec ?? 0);
+              const distanceDisplay = d.distanceStr ?? String((r.distance_m ?? 0) / 1000);
 
-                  {r.mode === "duration" ? (
+              return (
+                <div key={r.id} className="rounded bg-white/5 p-2">
+                  <div className="flex items-center gap-2" style={{flexWrap:"wrap"}}>
+                    {/* Repeats */}
                     <input
-                      className="w-24 field"
-                      value={secondsToHMS(r.duration_sec ?? 0)}
-                      onChange={e => patch(r.id, { duration_sec: HMSToSeconds(e.target.value) })}
-                      placeholder="mm:ss or h:mm:ss"
-                      title="Duration"
+                      className="w-20 field"
+                      type="number"
+                      min={1}
+                      value={r.repeats}
+                      onChange={(e) => updateLocal(r.id, { repeats: Math.max(1, Number(e.target.value || 1)) })}
+                      title="Repeats"
                     />
-                  ) : (
-                    <div className="flex items-center gap-1">
+
+                    {/* Mode */}
+                    <select
+                      className="field"
+                      value={r.mode}
+                      onChange={(e) => updateLocal(r.id, { mode: e.target.value as any })}
+                    >
+                      <option value="duration">By duration</option>
+                      <option value="distance">By distance</option>
+                    </select>
+
+                    {/* Duration / Distance (drafted) */}
+                    {r.mode === "duration" ? (
                       <input
                         className="w-24 field"
-                        type="number"
-                        min={0}
-                        value={(r.distance_m ?? 0) / 1000}
-                        onChange={e => patch(r.id, { distance_m: Math.max(0, Number(e.target.value || 0)) * 1000 })}
-                        placeholder="km"
-                        title="Distance (km)"
+                        value={durationDisplay}
+                        onChange={(e) =>
+                          setDraft((prev) => ({ ...prev, [r.id]: { ...(prev[r.id] || {}), durationStr: e.target.value } }))
+                        }
+                        onBlur={(e) => {
+                          const sec = HMSToSeconds(e.target.value);
+                          setDraft((prev) => ({ ...prev, [r.id]: { ...(prev[r.id] || {}), durationStr: undefined } }));
+                          updateLocal(r.id, { duration_sec: sec, distance_m: null });
+                        }}
+                        placeholder="mm:ss or h:mm:ss"
+                        title="Duration"
+                        inputMode="numeric"
+                        autoComplete="off"
+                        spellCheck={false}
                       />
-                      <span className="text-xs opacity-70">km</span>
-                    </div>
-                  )}
+                    ) : (
+                      <div className="flex items-center gap-1">
+                        <input
+                          className="w-24 field"
+                          value={distanceDisplay}
+                          onChange={(e) =>
+                            setDraft((prev) => ({
+                              ...prev,
+                              [r.id]: { ...(prev[r.id] || {}), distanceStr: e.target.value.replace(/[^0-9.]/g, "") },
+                            }))
+                          }
+                          onBlur={(e) => {
+                            const km = Number(e.target.value || 0);
+                            setDraft((prev) => ({ ...prev, [r.id]: { ...(prev[r.id] || {}), distanceStr: undefined } }));
+                            updateLocal(r.id, { distance_m: Math.max(0, km) * 1000, duration_sec: null });
+                          }}
+                          placeholder="km"
+                          title="Distance (km)"
+                          inputMode="decimal"
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                        <span className="text-xs opacity-70">km</span>
+                      </div>
+                    )}
 
-                  <select
-                    className="field"
-                    value={r.target_type}
-                    onChange={e => patch(r.id, { target_type: e.target.value as any })}
-                  >
-                    <option value="rpe">RPE</option>
-                    <option value="pace">Pace</option>
-                    <option value="hr">HR</option>
-                    <option value="power">Power</option>
-                  </select>
+                    {/* Target type */}
+                    <select
+                      className="field"
+                      value={r.target_type}
+                      onChange={(e) => updateLocal(r.id, { target_type: e.target.value as any })}
+                    >
+                      <option value="rpe">RPE</option>
+                      <option value="pace">Pace</option>
+                      <option value="hr">HR</option>
+                      <option value="power">Power</option>
+                    </select>
 
-                  <input
-                    className="w-20 field"
-                    type="number"
-                    value={r.target_low ?? 0}
-                    onChange={e => patch(r.id, { target_low: Number(e.target.value || 0) })}
-                    placeholder="low"
-                    title="Target low"
+                    {/* Target range */}
+                    <input
+                      className="w-20 field"
+                      type="number"
+                      value={r.target_low ?? 0}
+                      onChange={(e) => updateLocal(r.id, { target_low: Number(e.target.value || 0) })}
+                      placeholder="low"
+                      title="Target low"
+                    />
+                    <span className="opacity-60">–</span>
+                    <input
+                      className="w-20 field"
+                      type="number"
+                      value={r.target_high ?? 0}
+                      onChange={(e) => updateLocal(r.id, { target_high: Number(e.target.value || 0) })}
+                      placeholder="high"
+                      title="Target high"
+                    />
+
+                    <button className="btn ml-auto" onClick={() => remove(r.id)}>Delete</button>
+                  </div>
+
+                  {/* Notes — fully isolated so focus never drops */}
+                  <NotesField
+                    rowId={r.id}
+                    initial={r.notes ?? ""}
+                    saveNotes={saveNotesDirect}
+                    ariaLabel={`Notes for interval ${idx + 1}`}
                   />
-                  <span className="opacity-60">–</span>
-                  <input
-                    className="w-20 field"
-                    type="number"
-                    value={r.target_high ?? 0}
-                    onChange={e => patch(r.id, { target_high: Number(e.target.value || 0) })}
-                    placeholder="high"
-                    title="Target high"
-                  />
 
-                  <button className="btn ml-auto" onClick={() => remove(r.id)}>Delete</button>
+                  {/* Live preview */}
+                  <div className="mt-2">
+                    <button className="btn w-full" type="button">
+                      {r.repeats}× {r.mode === "duration" ? durationDisplay : `${distanceDisplay} km`} @ {targetLabel(r)}
+                    </button>
+                  </div>
                 </div>
-
-                <textarea
-                  className="w-full field mt-2"
-                  rows={2}
-                  placeholder="Notes"
-                  value={r.notes ?? ""}
-                  onChange={e => patch(r.id, { notes: e.target.value })}
-                />
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -246,9 +388,11 @@ export default function EnduranceEditor({
     <div className="mt-3">
       <div className="flex items-center gap-2">
         <h3 className="font-semibold">Endurance Intervals</h3>
-        {note ? <span className="text-xs" style={{color:"#fca5a5"}}>{note}</span> : null}
+        {note ? <span className="text-xs" style={{ color: "#fca5a5" }}>{note}</span> : null}
       </div>
-      {loading ? <div className="mt-2">Loading…</div> : (
+      {loading ? (
+        <div className="mt-2">Loading…</div>
+      ) : (
         <div className="grid grid-3 mt-3">
           <Block block="warmup" />
           <Block block="main" />
