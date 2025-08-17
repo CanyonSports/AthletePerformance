@@ -1,25 +1,31 @@
-// app/coach/page.tsx
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import NavBar from "@/components/NavBar";
-import { getSupabase } from "@/lib/supabaseClient";
-import CoachInboxBell from "@/components/CoachInboxBell";
-import {
-  Users,
-  CalendarRange,
-  CheckCircle2,
-  Percent,
-  Inbox,
-  UserCircle2,
-} from "lucide-react";
+import { useRouter } from "next/navigation";
+import * as Supa from "@/lib/supabaseClient";
+import { Users, Mail, CalendarDays, ChevronDown, ChevronRight, LayoutTemplate } from "lucide-react";
 
+/* ---------------- Types ---------------- */
 type Profile = {
   id: string;
   email: string | null;
   display_name: string | null;
   role: "athlete" | "coach" | "admin" | null;
+};
+
+type CoachLink = { coach_id: string; athlete_id: string; created_at: string };
+
+type AthleteLite = { id: string; display_name: string | null; email: string | null };
+
+type MessageRow = {
+  id: string;
+  athlete_id: string;
+  sender_id: string;
+  recipient_id: string;
+  body: string;
+  created_at: string;
+  read_at: string | null;
 };
 
 function ymd(d = new Date()) {
@@ -28,316 +34,333 @@ function ymd(d = new Date()) {
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 }
+function startOfWeekISO(d = new Date()) {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const dow = (x.getDay() + 6) % 7; // Monday=0
+  x.setDate(x.getDate() - dow);
+  return ymd(x);
+}
 function addDaysISO(iso: string, days: number) {
   const [y, m, d] = iso.split("-").map(Number);
-  const dt = new Date(y, (m ?? 1) - 1, d ?? 1);
+  const dt = new Date(y, (m ?? 1) - 1, d ?? 1, 12);
   dt.setDate(dt.getDate() + days);
   return ymd(dt);
 }
-function startOfWeekISO(d = new Date()) {
-  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  const day = (x.getDay() + 6) % 7; // Monday=0
-  x.setDate(x.getDate() - day);
-  return ymd(x);
-}
 
+/* ---------------- Page ---------------- */
 export default function CoachDashboardPage() {
-  const supabase = useMemo(() => getSupabase(), []);
+  // Supabase (support getSupabase() or exported client)
+  const supabase = useMemo(() => {
+    const anyS = Supa as any;
+    try { if (typeof anyS.getSupabase === "function") return anyS.getSupabase(); } catch {}
+    if (anyS.supabase) return anyS.supabase;
+    return null;
+  }, []);
+  const isConfigured = Boolean(supabase);
+
+  const router = useRouter();
+
   const [me, setMe] = useState<Profile | null>(null);
-  const [athletes, setAthletes] = useState<Profile[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [status, setStatus] = useState("");
   const [note, setNote] = useState("");
 
-  // KPI state
-  const [athleteCount, setAthleteCount] = useState(0);
-  const [weekScheduled, setWeekScheduled] = useState(0);
-  const [weekCompleted, setWeekCompleted] = useState(0);
-  const [adherencePct, setAdherencePct] = useState<number>(0);
-  const [unreadCount, setUnreadCount] = useState(0);
+  const [athletes, setAthletes] = useState<AthleteLite[]>([]);
+  const [unreadCount, setUnreadCount] = useState<number>(0);
+  const [recentMessages, setRecentMessages] = useState<MessageRow[]>([]);
+  const [sessionsThisWeek, setSessionsThisWeek] = useState<number>(0);
 
-  const msgChannelRef = useRef<any>(null);
+  const [inboxOpen, setInboxOpen] = useState(false);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const thisWeekStart = useMemo(() => startOfWeekISO(), []);
+
+  /* -------------- Load profile & gate to coach -------------- */
+  const loadMe = useCallback(async () => {
+    if (!isConfigured || !supabase) return;
     setNote("");
     try {
+      const { data: { user }, error } = await supabase.auth.getUser();
+      if (error) throw error;
+      if (!user) { router.push("/login"); return; }
+
+      const res = await supabase.from("profiles").select("*").eq("id", user.id).single();
+      if (res.error) throw res.error;
+      const profile = res.data as Profile;
+      setMe(profile);
+
+      // If not a coach/admin, send them back to athlete dashboard
+      if (profile.role !== "coach" && profile.role !== "admin") {
+        router.push("/dashboard");
+      }
+    } catch (e: any) {
+      setNote(e.message ?? String(e));
+    }
+  }, [isConfigured, supabase, router]);
+
+  useEffect(() => { loadMe(); }, [loadMe]);
+
+  /* -------------- Load athletes (linked) -------------- */
+  const loadAthletes = useCallback(async () => {
+    if (!isConfigured || !supabase) return;
+    try {
       const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { setNote("Please sign in."); setLoading(false); return; }
+      if (!user) return;
 
-      // me
-      const meRes = await supabase.from("profiles").select("*").eq("id", user.id).single();
-      if (meRes.error) throw meRes.error;
-      const meProfile = meRes.data as Profile;
-      setMe(meProfile);
-
-      if (meProfile.role !== "coach" && meProfile.role !== "admin") {
-        setNote("You must be a coach to view this page.");
-        setAthletes([]);
-        setAthleteCount(0);
-        setWeekScheduled(0);
-        setWeekCompleted(0);
-        setAdherencePct(0);
-        setUnreadCount(0);
-        setLoading(false);
-        return;
-      }
-
-      // linked athletes
-      const links = await supabase.from("coach_athletes").select("athlete_id").eq("coach_id", user.id);
+      const links = await supabase
+        .from("coach_athletes")
+        .select("athlete_id")
+        .eq("coach_id", user.id);
       if (links.error) throw links.error;
-      const ids: string[] = (links.data ?? []).map((r: any) => r.athlete_id);
-      setAthleteCount(ids.length);
 
-      if (ids.length > 0) {
-        const ppl = await supabase.from("profiles").select("id,email,display_name").in("id", ids);
-        if (ppl.error) throw ppl.error;
-        setAthletes((ppl.data ?? []) as Profile[]);
-      } else {
-        setAthletes([]);
-      }
+      const ids = (links.data ?? []).map((r: any) => r.athlete_id);
+      if (ids.length === 0) { setAthletes([]); return; }
 
-      // KPIs
-      const today = ymd(new Date());
-      const next7 = addDaysISO(today, 7);
-      const weekStart = startOfWeekISO(new Date());
-      const weekEnd = addDaysISO(weekStart, 7);
+      const profs = await supabase
+        .from("profiles")
+        .select("id,display_name,email")
+        .in("id", ids);
+      if (profs.error) throw profs.error;
 
-      // scheduled this week (all statuses)
-      let scheduledCount = 0;
-      let completedCount = 0;
+      const list = (profs.data ?? []) as AthleteLite[];
+      list.sort((a, b) => (a.display_name || a.email || "").localeCompare(b.display_name || b.email || ""));
+      setAthletes(list);
+    } catch (e: any) {
+      setNote(e.message ?? String(e));
+    }
+  }, [isConfigured, supabase]);
 
-      if (ids.length > 0) {
-        const scheduled = await supabase
-          .from("training_plan_items")
-          .select("id", { count: "exact", head: true })
-          .in("user_id", ids)
-          .gte("session_date", weekStart)
-          .lt("session_date", weekEnd);
-        if (!scheduled.error) scheduledCount = scheduled.count ?? 0;
+  /* -------------- Load KPIs -------------- */
+  const loadKPIs = useCallback(async () => {
+    if (!isConfigured || !supabase) return;
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return;
 
-        const completed = await supabase
-          .from("training_plan_items")
-          .select("id", { count: "exact", head: true })
-          .in("user_id", ids)
-          .eq("status", "completed")
-          .gte("session_date", weekStart)
-          .lt("session_date", weekEnd);
-        if (!completed.error) completedCount = completed.count ?? 0;
-      }
-
-      setWeekScheduled(scheduledCount);
-      setWeekCompleted(completedCount);
-      setAdherencePct(scheduledCount > 0 ? Math.round((completedCount / scheduledCount) * 100) : 0);
-
-      // unread messages for coach
+      // Unread messages aimed at this coach
       const unread = await supabase
         .from("messages")
         .select("id", { count: "exact", head: true })
-        .eq("recipient_id", meProfile.id)
+        .eq("recipient_id", user.id)
         .is("read_at", null);
-      setUnreadCount(unread.error ? 0 : (unread.count ?? 0));
+      if (unread.error) throw unread.error;
+      setUnreadCount(unread.count ?? 0);
+
+      // Sessions scheduled for linked athletes this week
+      const links = await supabase
+        .from("coach_athletes")
+        .select("athlete_id")
+        .eq("coach_id", user.id);
+      if (links.error) throw links.error;
+
+      const ids = (links.data ?? []).map((r: any) => r.athlete_id);
+      if (ids.length === 0) { setSessionsThisWeek(0); return; }
+
+      const weekEnd = addDaysISO(thisWeekStart, 7);
+      const sesh = await supabase
+        .from("training_plan_items")
+        .select("id", { head: true, count: "exact" })
+        .in("user_id", ids)
+        .gte("session_date", thisWeekStart)
+        .lt("session_date", weekEnd);
+      if (sesh.error) throw sesh.error;
+      setSessionsThisWeek(sesh.count ?? 0);
     } catch (e: any) {
       setNote(e.message ?? String(e));
-    } finally {
-      setLoading(false);
     }
-  }, [supabase]);
+  }, [isConfigured, supabase, thisWeekStart]);
 
-  useEffect(() => { load(); }, [load]);
-
-  // Realtime: update unread count when new messages arrive / change
-  useEffect(() => {
-    if (!me) return;
-
-    // clear previous
+  /* -------------- Load recent messages (collapsible inbox) -------------- */
+  const loadRecentMessages = useCallback(async () => {
+    if (!isConfigured || !supabase) return;
     try {
-      const old = msgChannelRef.current;
-      if (old) {
-        if (typeof (supabase as any).removeChannel === "function") {
-          (supabase as any).removeChannel(old);
-        } else if (typeof old.unsubscribe === "function") {
-          old.unsubscribe();
-        }
-        msgChannelRef.current = null;
-      }
-    } catch {}
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return;
 
-    const ch = supabase
-      .channel(`coach-inbox-${me.id}`)
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "messages", filter: `recipient_id=eq.${me.id}` },
-        async () => {
-          const unread = await supabase
-            .from("messages")
-            .select("id", { count: "exact", head: true })
-            .eq("recipient_id", me.id)
-            .is("read_at", null);
-          setUnreadCount(unread.error ? 0 : (unread.count ?? 0));
-        }
-      )
-      .subscribe();
+      const res = await supabase
+        .from("messages")
+        .select("*")
+        .eq("recipient_id", user.id)
+        .order("created_at", { ascending: false })
+        .limit(10);
+      if (res.error) throw res.error;
 
-    msgChannelRef.current = ch;
-    return () => {
-      try {
-        const cur = msgChannelRef.current;
-        if (!cur) return;
-        if (typeof (supabase as any).removeChannel === "function") {
-          (supabase as any).removeChannel(cur);
-        } else if (typeof cur.unsubscribe === "function") {
-          cur.unsubscribe();
-        }
-        msgChannelRef.current = null;
-      } catch {}
-    };
-  }, [supabase, me]);
+      setRecentMessages((res.data ?? []) as MessageRow[]);
+    } catch (e: any) {
+      setNote(e.message ?? String(e));
+    }
+  }, [isConfigured, supabase]);
 
+  useEffect(() => { loadAthletes(); loadKPIs(); loadRecentMessages(); }, [loadAthletes, loadKPIs, loadRecentMessages]);
+
+  /* -------------- Realtime: messages + links -------------- */
+  useEffect(() => {
+    if (!isConfigured || !supabase) return;
+    let mounted = true;
+
+    (async () => {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return;
+
+      const ch = supabase
+        .channel("coach-dashboard")
+        .on("postgres_changes",
+          { event: "*", schema: "public", table: "messages", filter: `recipient_id=eq.${user.id}` },
+          () => { if (mounted) { loadKPIs(); loadRecentMessages(); } }
+        )
+        .on("postgres_changes",
+          { event: "*", schema: "public", table: "coach_athletes", filter: `coach_id=eq.${user.id}` },
+          () => { if (mounted) { loadAthletes(); loadKPIs(); } }
+        )
+        .subscribe();
+
+      // cleanup
+      return () => {
+        try { supabase.removeChannel(ch); } catch {}
+      };
+    })();
+
+    return () => { mounted = false; };
+  }, [isConfigured, supabase, loadAthletes, loadKPIs, loadRecentMessages]);
+
+  /* ---------------- UI helpers ---------------- */
+  const athletesCount = athletes.length;
+
+  function displayName(a: AthleteLite) {
+    return a.display_name || a.email || a.id.slice(0, 8);
+  }
+
+  /* ---------------- Render ---------------- */
   return (
-    <div className="max-w-7xl mx-auto pb-14">
-      <NavBar />
-
-      {/* Header */}
-      <div className="mt-6 card p-4 flex items-center gap-3">
-        <Users className="text-emerald-300" />
-        <div>
-          <p className="text-xs text-slate-400">Coach</p>
-          <h1 className="text-xl font-semibold">Dashboard</h1>
-        </div>
-        <div className="ml-auto text-sm" style={{ color: "var(--muted)" }}>
-          {loading ? "Loading…" : ""}
-          {note && !loading ? note : ""}
-        </div>
-      </div>
-
-      {/* KPI Grid */}
-      <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5">
-        <KpiCard
-          icon={<Users className="w-5 h-5" />}
-          label="Athletes"
-          value={athleteCount}
-          sub="Linked to you"
-        />
-        <KpiCard
-          icon={<CalendarRange className="w-5 h-5" />}
-          label="This Week — Scheduled"
-          value={weekScheduled}
-          sub="All statuses"
-        />
-        <KpiCard
-          icon={<CheckCircle2 className="w-5 h-5" />}
-          label="This Week — Completed"
-          value={weekCompleted}
-          sub="Marked completed"
-        />
-        <KpiCard
-          icon={<Percent className="w-5 h-5" />}
-          label="Adherence"
-          value={`${adherencePct}%`}
-          sub="Completed / Scheduled"
-        />
-        <KpiCard
-          icon={<Inbox className="w-5 h-5" />}
-          label="Unread"
-          value={unreadCount}
-          sub="Messages"
-          highlight={unreadCount > 0}
-        />
-      </div>
-
-      {/* Quick Inbox (compact) */}
-      <div className="mt-6 card p-4 flex items-center gap-3">
-        <Inbox className="text-emerald-300" />
-        <div className="min-w-0">
-          <div className="font-semibold">Inbox</div>
-          <div className="text-sm" style={{ color: "var(--muted)" }}>
-            {unreadCount === 0 ? "You’re all caught up." : `${unreadCount} unread message${unreadCount === 1 ? "" : "s"}.`}
+    <div className="max-w-7xl mx-auto pb-16">
+      {/* Sticky header */}
+      <div
+        className="card p-4"
+        style={{ position: "sticky", top: 0, zIndex: 20, backdropFilter: "blur(6px)", background: "rgba(0,0,0,0.6)" }}
+      >
+        <div className="flex items-center gap-3" style={{ flexWrap: "wrap" }}>
+          <h1 className="text-xl font-semibold">Coach Dashboard</h1>
+          <div className="ml-auto flex items-center gap-2">
+            {/* NEW: Templates button */}
+            <Link href="/coach/templates" className="btn" title="Open Template Library">
+              <LayoutTemplate className="w-4 h-4 mr-1" />
+              Templates
+            </Link>
           </div>
         </div>
-        <div className="ml-auto flex items-center gap-2">
-          <Link className="btn btn-dark" href="/coach/inbox">Open Inbox</Link>
+        {note ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{note}</div> : null}
+      </div>
+
+      {/* KPI cards */}
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mt-4">
+        <div className="card p-4">
+          <div className="flex items-center gap-3">
+            <div className="rounded-full p-2 bg-white/10"><Users className="w-5 h-5 text-emerald-300" /></div>
+            <div>
+              <div className="text-sm" style={{ color: "var(--muted)" }}>Athletes</div>
+              <div className="text-2xl font-semibold">{athletesCount}</div>
+            </div>
+          </div>
+        </div>
+
+        <div className="card p-4">
+          <div className="flex items-center gap-3">
+            <div className="rounded-full p-2 bg-white/10"><Mail className="w-5 h-5 text-emerald-300" /></div>
+            <div>
+              <div className="text-sm" style={{ color: "var(--muted)" }}>Unread Messages</div>
+              <div className="text-2xl font-semibold">{unreadCount}</div>
+            </div>
+          </div>
+        </div>
+
+        <div className="card p-4">
+          <div className="flex items-center gap-3">
+            <div className="rounded-full p-2 bg-white/10"><CalendarDays className="w-5 h-5 text-emerald-300" /></div>
+            <div>
+              <div className="text-sm" style={{ color: "var(--muted)" }}>Sessions This Week</div>
+              <div className="text-2xl font-semibold">{sessionsThisWeek}</div>
+            </div>
+          </div>
         </div>
       </div>
 
-      {/* Athletes grid — no message previews here */}
+      {/* Collapsible Inbox */}
       <div className="mt-6 card p-4">
-        <div className="flex items-center gap-2">
-          <h3 className="font-semibold">Your Athletes</h3>
-          <span className="text-sm ml-auto" style={{ color: "var(--muted)" }}>
-            {athletes.length} linked
+        <button
+          className="w-full text-left flex items-center gap-2"
+          onClick={() => setInboxOpen((v) => !v)}
+          aria-expanded={inboxOpen}
+        >
+          {inboxOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+          <span className="font-semibold">Inbox</span>
+          {unreadCount > 0 ? (
+            <span className="ml-2 inline-flex items-center justify-center text-xs rounded-full px-2 py-0.5"
+                  style={{ background: "rgba(16,185,129,0.15)", color: "rgb(16,185,129)" }}>
+              {unreadCount} new
+            </span>
+          ) : null}
+          <span className="ml-auto text-xs" style={{ color: "var(--muted)" }}>
+            {inboxOpen ? "Hide" : "Show"}
           </span>
-        </div>
+        </button>
 
-        {loading ? (
-          <div className="mt-3 text-sm" style={{ color: "var(--muted)" }}>Loading athletes…</div>
-        ) : athletes.length === 0 ? (
-          <div className="mt-3 text-sm" style={{ color: "var(--muted)" }}>
-            No athletes linked yet. Share an invite or link from an athlete’s profile.
-          </div>
-        ) : (
-          <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {athletes.map((a) => {
-              const name = a.display_name || a.email || "Athlete";
-              const initial = (name || "?").slice(0, 1).toUpperCase();
-              return (
-                <div key={a.id} className="card p-4 flex flex-col gap-3">
-                  <div className="flex items-center gap-3">
-                    <div className="avatar">{initial}</div>
-                    <div className="min-w-0">
-                      <div className="font-medium truncate">{name}</div>
-                      <div className="text-xs truncate" style={{ color: "var(--muted)" }}>
-                        {a.email || "—"}
-                      </div>
-                    </div>
+        {inboxOpen && (
+          <div className="mt-3 space-y-2">
+            {recentMessages.length === 0 ? (
+              <div className="text-sm" style={{ color: "var(--muted)" }}>No messages yet.</div>
+            ) : recentMessages.map((m) => (
+              <div key={m.id} className="rounded bg-white/5 p-2 flex items-start gap-2">
+                <div className="flex-1">
+                  <div className="text-sm">
+                    <span className="opacity-80">{new Date(m.created_at).toLocaleString()}</span>
+                    {m.read_at == null ? <span className="ml-2 text-xs" style={{ color: "rgb(16,185,129)" }}>• new</span> : null}
                   </div>
-
-                  <div className="mt-1 flex items-center gap-2">
-                    <Link className="btn btn-dark w-full" href={`/coach-console/${a.id}`}>
-                      Open Console
-                    </Link>
-                  </div>
-
-                  <div className="text-xs" style={{ color: "var(--muted)" }}>
-                    <div className="inline-flex items-center gap-1">
-                      <UserCircle2 className="w-3 h-3" />
-                      {a.id.slice(0, 8)}
-                    </div>
-                  </div>
+                  <div className="text-sm mt-1 line-clamp-2">{m.body}</div>
                 </div>
-              );
-            })}
+                <Link
+                  href={`/coach-console/${m.athlete_id}?focusMessageId=${m.id}`}
+                  className="btn btn-dark"
+                  title="Open in athlete console"
+                >
+                  Open
+                </Link>
+              </div>
+            ))}
+            <div className="pt-2">
+              <Link href="/coach/inbox" className="btn">Go to Inbox</Link>
+            </div>
           </div>
         )}
       </div>
 
-      {/* Collapsed inbox bell (only appears when there are unread messages) */}
-      <CoachInboxBell />
-    </div>
-  );
-}
+      {/* Athletes list */}
+      <div className="mt-6 card p-4">
+        <div className="flex items-center gap-2">
+          <h3 className="font-semibold">Your Athletes</h3>
+          <span className="text-sm ml-auto" style={{ color: "var(--muted)" }}>
+            Week of {new Date(thisWeekStart).toLocaleDateString()}
+          </span>
+        </div>
 
-/* --- Simple KPI card component (inline to avoid extra file) --- */
-function KpiCard({
-  icon,
-  label,
-  value,
-  sub,
-  highlight,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: number | string;
-  sub?: string;
-  highlight?: boolean;
-}) {
-  return (
-    <div className={`card p-4 ${highlight ? "ring-1 ring-emerald-400/60" : ""}`}>
-      <div className="flex items-center justify-between">
-        <div className="text-slate-300">{icon}</div>
-        <div className="text-xs" style={{ color: "var(--muted)" }}>{sub || " "}</div>
+        {athletes.length === 0 ? (
+          <div className="text-sm mt-2" style={{ color: "var(--muted)" }}>
+            You have no linked athletes yet.
+          </div>
+        ) : (
+          <div className="mt-3 grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {athletes.map((a) => (
+              <div key={a.id} className="card p-3">
+                <div className="flex items-center gap-2">
+                  <div className="avatar">{(displayName(a) || "?").slice(0, 1).toUpperCase()}</div>
+                  <div className="flex-1">
+                    <div className="font-medium">{displayName(a)}</div>
+                    <div className="text-xs" style={{ color: "var(--muted)" }}>{a.email}</div>
+                  </div>
+                  <Link href={`/coach-console/${a.id}`} className="btn">Open Console</Link>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
-      <div className="mt-2 text-sm" style={{ color: "var(--muted)" }}>{label}</div>
-      <div className="text-2xl font-semibold">{value}</div>
     </div>
   );
 }

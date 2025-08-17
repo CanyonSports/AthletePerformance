@@ -2,11 +2,16 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import NavBar from "@/components/NavBar";
 import WeekPicker from "@/components/WeekPicker";
 import * as Supa from "@/lib/supabaseClient";
+import AthleteThread from "@/components/AthleteThread";
+import {
+  Mail, Phone, CalendarDays, User as UserIcon,
+  Activity, HeartPulse, TrendingUp, TrendingDown, Minus
+} from "lucide-react";
 
 /* ---------- Types ---------- */
 type PlanItem = {
@@ -21,11 +26,30 @@ type PlanItem = {
   created_at?: string;
 };
 
+// Extendable profile (extra fields are optional & safe)
 type Profile = {
   id: string;
   email: string | null;
   display_name: string | null;
   role: "athlete" | "coach" | "admin" | null;
+
+  // Optional demographics/contact your app may add
+  first_name?: string | null;
+  last_name?: string | null;
+  phone?: string | null;
+  dob?: string | null;              // yyyy-mm-dd
+  gender?: string | null;
+  height_cm?: number | null;
+  weight_kg?: number | null;
+  location?: string | null;
+};
+
+type MeasurementRow = {
+  id: string;
+  user_id: string;
+  sport: string | null;
+  test_date: string; // yyyy-mm-dd
+  data: Record<string, any> | null; // e.g., { resting_hr: 48, max_hr: 193, hrv: 82, vo2max: 52 }
 };
 
 /* ---------- Helpers ---------- */
@@ -56,9 +80,48 @@ function weekdayLabel(iso: string) {
 function isUUID(v: string | undefined | null) {
   return !!v && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
 }
+function formatPhone(s?: string | null) {
+  if (!s) return "—";
+  const digits = s.replace(/\D/g, "");
+  if (digits.length === 10) return `(${digits.slice(0,3)}) ${digits.slice(3,6)}-${digits.slice(6)}`;
+  return s;
+}
+function ageFromDOB(dob?: string | null) {
+  if (!dob) return "—";
+  const d = fromYMD(dob);
+  if (Number.isNaN(d.getTime())) return "—";
+  const now = new Date();
+  let age = now.getFullYear() - d.getFullYear();
+  const m = now.getMonth() - d.getMonth();
+  if (m < 0 || (m === 0 && now.getDate() < d.getDate())) age--;
+  return `${age}`;
+}
+function cmToFtIn(cm?: number | null) {
+  if (!cm || cm <= 0) return "—";
+  const inches = Math.round(cm / 2.54);
+  const ft = Math.floor(inches / 12);
+  const inch = inches % 12;
+  return `${ft}′${inch}″`;
+}
+function kgToLb(kg?: number | null) {
+  if (!kg || kg <= 0) return "—";
+  return `${Math.round(kg * 2.20462)}`;
+}
 
+type Trend = "up" | "down" | "flat" | null;
+function trendFrom(prev?: number | null, curr?: number | null): Trend {
+  if (curr == null || prev == null) return null;
+  if (curr > prev) return "up";
+  if (curr < prev) return "down";
+  return "flat";
+}
+
+/* ---------- Page ---------- */
 export default function CoachAthleteConsolePage() {
   const params = useParams() as { athleteId?: string };
+  const searchParams = useSearchParams();
+  const focusMessageId = searchParams.get("focusMessageId") || undefined;
+
   // Decode & normalize the route param
   const athleteId = params?.athleteId ? decodeURIComponent(params.athleteId) : "";
 
@@ -81,7 +144,8 @@ export default function CoachAthleteConsolePage() {
   const [loading, setLoading] = useState(false);
   const [newDate, setNewDate] = useState<string>(weekStart);
 
-  const [activeTab, setActiveTab] = useState<"sessions" | "builder">("sessions");
+  // Tabs (incl. Messages)
+  const [activeTab, setActiveTab] = useState<"sessions" | "builder" | "messages">("sessions");
   const [drafts, setDrafts] = useState<Record<string, { title: string; details: string }>>({});
 
   // targeted errors
@@ -89,14 +153,19 @@ export default function CoachAthleteConsolePage() {
   const [addError, setAddError] = useState("");
   const [saveError, setSaveError] = useState("");
   const [deleteError, setDeleteError] = useState("");
-  const [toolsError, setToolsError] = useState("");
+
+  // Athlete summary state
+  const [metricsLoading, setMetricsLoading] = useState(false);
+  const [metricsError, setMetricsError] = useState<string | null>(null);
+  const [latestRows, setLatestRows] = useState<MeasurementRow[]>([]);
 
   // throttle realtime after optimistic writes
   const lastMutationRef = useRef<number>(0);
 
-  // move UI per-session
-  const [moveOpen, setMoveOpen] = useState<Record<string, boolean>>({});
-  const [moveTarget, setMoveTarget] = useState<Record<string, string>>({});
+  /* ---------- Auto-open Messages tab if focusMessageId is present ---------- */
+  useEffect(() => {
+    if (focusMessageId) setActiveTab("messages");
+  }, [focusMessageId]);
 
   /* ---------- Load me + athlete + authorization ---------- */
   const loadWho = useCallback(async () => {
@@ -146,7 +215,7 @@ export default function CoachAthleteConsolePage() {
   const loadWeek = useCallback(async () => {
     if (!isConfigured || !supabase || !isUUID(athleteId)) return;
     setLoading(true);
-    setAddError(""); setSaveError(""); setDeleteError(""); setToolsError("");
+    setAddError(""); setSaveError(""); setDeleteError("");
     try {
       const end = addDaysISO(weekStart, 7);
       const { data, error } = await supabase
@@ -169,6 +238,29 @@ export default function CoachAthleteConsolePage() {
 
   useEffect(() => { loadWeek(); }, [loadWeek]);
 
+  /* ---------- Athlete metrics (summary) ---------- */
+  const loadMetrics = useCallback(async () => {
+    if (!isConfigured || !supabase || !isUUID(athleteId)) return;
+    setMetricsLoading(true);
+    setMetricsError(null);
+    try {
+      const { data, error } = await supabase
+        .from("measurements")
+        .select("id,user_id,sport,test_date,data")
+        .eq("user_id", athleteId)
+        .order("test_date", { ascending: true })
+        .limit(100); // enough history to find prev values
+      if (error) throw error;
+      setLatestRows((data || []) as MeasurementRow[]);
+    } catch (e: any) {
+      setMetricsError(e.message ?? String(e));
+    } finally {
+      setMetricsLoading(false);
+    }
+  }, [isConfigured, supabase, athleteId]);
+
+  useEffect(() => { loadMetrics(); }, [loadMetrics]);
+
   /* ---------- Realtime refresh ---------- */
   useEffect(() => {
     if (!isConfigured || !supabase || !isUUID(athleteId)) return;
@@ -184,12 +276,17 @@ export default function CoachAthleteConsolePage() {
           if (mounted) loadWeek();
         }
       )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "measurements", filter: `user_id=eq.${athleteId}` },
+        () => { if (mounted) loadMetrics(); }
+      )
       .subscribe();
     return () => {
       mounted = false;
       try { supabase.removeChannel(channel); channel?.unsubscribe?.(); } catch {}
     };
-  }, [isConfigured, supabase, athleteId, loadWeek]);
+  }, [isConfigured, supabase, athleteId, loadWeek, loadMetrics]);
 
   /* ---------- Mutations (optimistic) ---------- */
   function sortByDate(list: PlanItem[]) {
@@ -278,128 +375,6 @@ export default function CoachAthleteConsolePage() {
     }
   }
 
-  /* ---------- Session tools ---------- */
-
-  // Duplicate a single session on the same date (optimistic)
-  async function duplicateSession(src: PlanItem) {
-    setToolsError("");
-    if (!isConfigured || !supabase) { setToolsError("Supabase not configured."); return; }
-    try {
-      // optimistic add a temp
-      const tempId = `dup-${Math.random().toString(36).slice(2)}`;
-      const temp: PlanItem = {
-        ...src,
-        id: tempId,
-        title: src.title ? `${src.title} (Copy)` : "Session (Copy)",
-      };
-      setItems(prev => sortByDate([...prev, temp]));
-      lastMutationRef.current = Date.now();
-
-      const { data, error } = await supabase
-        .from("training_plan_items")
-        .insert({
-          user_id: src.user_id,
-          session_date: src.session_date,
-          title: temp.title,
-          details: src.details,
-          duration_min: src.duration_min,
-          rpe: src.rpe,
-          status: "planned", // copies as planned
-        })
-        .select("*")
-        .single();
-      if (error) throw error;
-
-      setItems(prev => sortByDate(prev.map(it => it.id === tempId ? (data as PlanItem) : it)));
-    } catch (e: any) {
-      // reload to be safe if optimistic add failed
-      setToolsError(e.message ?? String(e));
-      await loadWeek();
-    }
-  }
-
-  // Toggle the inline move UI
-  function openMove(it: PlanItem) {
-    setMoveOpen(prev => ({ ...prev, [it.id]: !prev[it.id] }));
-    setMoveTarget(prev => ({ ...prev, [it.id]: prev[it.id] || it.session_date }));
-  }
-
-  // Move a session to a new date (optimistic)
-  async function moveSession(it: PlanItem) {
-    setToolsError("");
-    if (!isConfigured || !supabase) { setToolsError("Supabase not configured."); return; }
-    const target = moveTarget[it.id];
-    if (!target) { setToolsError("Pick a date to move to."); return; }
-
-    const before = items;
-    setItems(prev => sortByDate(prev.map(x => x.id === it.id ? { ...x, session_date: target } : x)));
-    lastMutationRef.current = Date.now();
-
-    const { error } = await supabase
-      .from("training_plan_items")
-      .update({ session_date: target })
-      .eq("id", it.id);
-
-    if (error) {
-      setItems(before);
-      setToolsError(error.message ?? String(error));
-    } else {
-      setMoveOpen(prev => ({ ...prev, [it.id]: false }));
-    }
-  }
-
-  // Copy all sessions in current week to the next week (optimistic batch)
-  async function copyWeekToNext() {
-    setToolsError("");
-    if (!isConfigured || !supabase) { setToolsError("Supabase not configured."); return; }
-    if (!authorized) { setToolsError("Link to this athlete first."); return; }
-
-    const weekEnd = addDaysISO(weekStart, 7);
-    const inWeek = items.filter(it => it.session_date >= weekStart && it.session_date < weekEnd);
-    if (inWeek.length === 0) { setToolsError("No sessions in this week to copy."); return; }
-
-    try {
-      // optimistic: add temps
-      const temps: PlanItem[] = inWeek.map(src => ({
-        ...src,
-        id: `wkcopy-${Math.random().toString(36).slice(2)}`,
-        session_date: addDaysISO(src.session_date, 7),
-        title: src.title ? `${src.title} (wk+1)` : "Session (wk+1)",
-        status: "planned",
-      }));
-      setItems(prev => sortByDate([...prev, ...temps]));
-      lastMutationRef.current = Date.now();
-
-      // insert real rows
-      const payload = inWeek.map(src => ({
-        user_id: src.user_id,
-        session_date: addDaysISO(src.session_date, 7),
-        title: src.title ? `${src.title} (wk+1)` : "Session (wk+1)",
-        details: src.details,
-        duration_min: src.duration_min,
-        rpe: src.rpe,
-        status: "planned",
-      }));
-      const { data, error } = await supabase
-        .from("training_plan_items")
-        .insert(payload)
-        .select("*");
-      if (error) throw error;
-
-      // Replace temps with real
-      // Match by (session_date, title) heuristic
-      const real = (data || []) as PlanItem[];
-      setItems(prev => {
-        let next = prev.filter(p => !p.id.startsWith("wkcopy-"));
-        next = sortByDate([...next, ...real]);
-        return next;
-      });
-    } catch (e: any) {
-      setToolsError(e.message ?? String(e));
-      await loadWeek();
-    }
-  }
-
   /* ---------- Link button (idempotent) ---------- */
   async function linkMeToAthlete() {
     try {
@@ -430,10 +405,30 @@ export default function CoachAthleteConsolePage() {
     }
   }
 
-  /* ---------- Derived ---------- */
-  const headerName = athlete?.display_name || athlete?.email || "(Athlete)";
-  const weekDays = Array.from({ length: 7 }, (_, i) => addDaysISO(weekStart, i));
-  const sessionsByDay = (iso: string) => items.filter(it => it.session_date === iso);
+  /* ---------- Derived (summary helpers) ---------- */
+  const headerName = athlete?.display_name || [athlete?.first_name, athlete?.last_name].filter(Boolean).join(" ") || athlete?.email || "(Athlete)";
+
+  // pull last + prev metric for a given key across measurement rows (ascending order list)
+  function lastTwoFor(key: string): { curr: number | null; prev: number | null } {
+    if (!latestRows.length) return { curr: null, prev: null };
+    let curr: number | null = null;
+    let prev: number | null = null;
+    for (let i = latestRows.length - 1; i >= 0; i--) {
+      const v = latestRows[i]?.data?.[key];
+      if (v == null || Number.isNaN(Number(v))) continue;
+      if (curr == null) curr = Number(v);
+      else { prev = Number(v); break; }
+    }
+    return { curr, prev };
+  }
+
+  const rhr = lastTwoFor("resting_hr");
+  const maxhr = lastTwoFor("max_hr");
+  const hrv = lastTwoFor("hrv");
+  const vo2 = lastTwoFor("vo2max");
+
+  const heightStr = athlete?.height_cm ? `${athlete.height_cm} cm (${cmToFtIn(athlete.height_cm)})` : "—";
+  const weightStr = athlete?.weight_kg ? `${athlete.weight_kg} kg (${kgToLb(athlete.weight_kg)} lb)` : "—";
 
   /* ---------- UI ---------- */
   return (
@@ -474,7 +469,95 @@ export default function CoachAthleteConsolePage() {
         )}
       </div>
 
-      {/* Two columns: Left = Add + Week Tools, Right = Tabs */}
+      {/* -------- Athlete Summary (NEW) -------- */}
+      <div className="mt-4 card p-4">
+        <div className="flex items-center gap-2" style={{ flexWrap: "wrap" }}>
+          <h3 className="font-semibold flex items-center gap-2"><UserIcon className="w-4 h-4" /> Athlete Summary</h3>
+          <span className="ml-auto text-xs" style={{ color: "var(--muted)" }}>
+            {metricsLoading ? "Loading metrics…" : (metricsError ? metricsError : "")}
+          </span>
+        </div>
+
+        {/* Top row: name + contact */}
+        <div className="mt-3 grid md:grid-cols-3 gap-4">
+          <div className="rounded bg-white/5 p-3">
+            <div className="text-sm" style={{ color: "var(--muted)" }}>Name</div>
+            <div className="text-lg font-semibold">
+              {[athlete?.first_name, athlete?.last_name].filter(Boolean).join(" ") || athlete?.display_name || "—"}
+            </div>
+          </div>
+          <div className="rounded bg-white/5 p-3">
+            <div className="text-sm flex items-center gap-1" style={{ color: "var(--muted)" }}>
+              <Mail className="w-3.5 h-3.5" /> Email
+            </div>
+            <div className="text-lg font-semibold break-all">{athlete?.email || "—"}</div>
+          </div>
+          <div className="rounded bg-white/5 p-3">
+            <div className="text-sm flex items-center gap-1" style={{ color: "var(--muted)" }}>
+              <Phone className="w-3.5 h-3.5" /> Phone
+            </div>
+            <div className="text-lg font-semibold">{formatPhone(athlete?.phone)}</div>
+          </div>
+        </div>
+
+        {/* Demographics */}
+        <div className="mt-3 grid md:grid-cols-4 gap-4">
+          <div className="rounded bg-white/5 p-3">
+            <div className="text-sm flex items-center gap-1" style={{ color: "var(--muted)" }}>
+              <CalendarDays className="w-3.5 h-3.5" /> DOB / Age
+            </div>
+            <div className="text-lg font-semibold">
+              {(athlete?.dob ? new Date(fromYMD(athlete.dob)).toLocaleDateString() : "—")} {athlete?.dob ? ` • ${ageFromDOB(athlete.dob)}y` : ""}
+            </div>
+          </div>
+          <div className="rounded bg-white/5 p-3">
+            <div className="text-sm" style={{ color: "var(--muted)" }}>Gender</div>
+            <div className="text-lg font-semibold">{athlete?.gender || "—"}</div>
+          </div>
+          <div className="rounded bg-white/5 p-3">
+            <div className="text-sm" style={{ color: "var(--muted)" }}>Height</div>
+            <div className="text-lg font-semibold">{heightStr}</div>
+          </div>
+          <div className="rounded bg-white/5 p-3">
+            <div className="text-sm" style={{ color: "var(--muted)" }}>Weight</div>
+            <div className="text-lg font-semibold">{weightStr}</div>
+          </div>
+        </div>
+
+        {/* KPI metrics with trend */}
+        <div className="mt-4 grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <MetricCard
+            title="Resting HR"
+            unit="bpm"
+            icon={<HeartPulse className="w-5 h-5 text-emerald-300" />}
+            current={rhr.curr}
+            previous={rhr.prev}
+          />
+          <MetricCard
+            title="Max HR"
+            unit="bpm"
+            icon={<Activity className="w-5 h-5 text-emerald-300" />}
+            current={maxhr.curr}
+            previous={maxhr.prev}
+          />
+          <MetricCard
+            title="HRV"
+            unit="ms"
+            icon={<Activity className="w-5 h-5 text-emerald-300" />}
+            current={hrv.curr}
+            previous={hrv.prev}
+          />
+          <MetricCard
+            title="VO₂max"
+            unit=""
+            icon={<Activity className="w-5 h-5 text-emerald-300" />}
+            current={vo2.curr}
+            previous={vo2.prev}
+          />
+        </div>
+      </div>
+
+      {/* Two columns: Left = Add, Right = Tabs */}
       <div className="mt-4 grid" style={{ gridTemplateColumns: "minmax(280px, 360px) 1fr", gap: 16 }}>
         {/* LEFT */}
         <aside className="flex flex-col gap-3">
@@ -501,20 +584,6 @@ export default function CoachAthleteConsolePage() {
             </div>
             {addError ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{addError}</div> : null}
           </div>
-
-          {/* Week tools */}
-          <div className="card p-4">
-            <h3 className="font-semibold">Week Tools</h3>
-            <p className="text-sm" style={{ color: "var(--muted)" }}>
-              Bulk operations for the visible week.
-            </p>
-            <div className="mt-3 flex flex-wrap gap-2">
-              <button className="btn btn-dark" onClick={copyWeekToNext} disabled={!authorized}>
-                Copy this week → next week
-              </button>
-            </div>
-            {toolsError ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{toolsError}</div> : null}
-          </div>
         </aside>
 
         {/* RIGHT */}
@@ -534,10 +603,16 @@ export default function CoachAthleteConsolePage() {
               >
                 Builder
               </button>
+              <button
+                className={`tab ${activeTab === "messages" ? "tab-active" : ""}`}
+                onClick={() => setActiveTab("messages")}
+              >
+                Messages
+              </button>
             </div>
           </div>
 
-          {/* READ-ONLY list (with tools) */}
+          {/* READ-ONLY list */}
           {activeTab === "sessions" ? (
             <div className="card p-4">
               <div className="flex items-center gap-2">
@@ -549,8 +624,8 @@ export default function CoachAthleteConsolePage() {
               </div>
 
               <div className="mt-3 space-y-4">
-                {weekDays.map(day => {
-                  const list = sessionsByDay(day);
+                {Array.from({ length: 7 }, (_, i) => addDaysISO(weekStart, i)).map(day => {
+                  const list = items.filter(it => it.session_date === day);
                   return (
                     <div key={day}>
                       <div className="text-sm font-semibold">
@@ -563,31 +638,13 @@ export default function CoachAthleteConsolePage() {
                         <div className="mt-2 grid" style={{ gap: 8 }}>
                           {list.map(it => (
                             <div key={it.id} className="card p-3">
-                              <div className="flex items-center gap-2" style={{ flexWrap: "wrap" }}>
+                              <div className="flex items-center gap-2">
                                 <div className="font-semibold">{it.title || "(Untitled session)"}</div>
-                                <div className="ml-auto flex gap-2" style={{ flexWrap: "wrap" }}>
+                                <div className="ml-auto flex gap-2">
                                   <Link className="btn" href={`/coach-console/${athleteId}/session/${it.id}`}>Edit</Link>
-                                  <button className="btn" onClick={() => duplicateSession(it)}>Duplicate</button>
-                                  <button className="btn" onClick={() => openMove(it)}>{moveOpen[it.id] ? "Cancel Move" : "Move"}</button>
                                   <button className="btn btn-dark" onClick={() => deleteSession(it.id)}>Delete</button>
                                 </div>
                               </div>
-
-                              {/* Move inline controls */}
-                              {moveOpen[it.id] ? (
-                                <div className="mt-2 flex items-center gap-2">
-                                  <input
-                                    type="date"
-                                    className="px-2 py-1 rounded bg-white/5 border border-white/10"
-                                    value={moveTarget[it.id] || it.session_date}
-                                    onChange={(e) => setMoveTarget(prev => ({ ...prev, [it.id]: e.target.value }))}
-                                  />
-                                  <button className="btn btn-dark" onClick={() => moveSession(it)}>
-                                    Move to date
-                                  </button>
-                                </div>
-                              ) : null}
-
                               <div className="text-sm mt-1" style={{ color: "var(--muted)" }}>
                                 {it.details || "(No description)"}
                               </div>
@@ -600,9 +657,8 @@ export default function CoachAthleteConsolePage() {
                 })}
               </div>
               {deleteError ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{deleteError}</div> : null}
-              {toolsError ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{toolsError}</div> : null}
             </div>
-          ) : (
+          ) : activeTab === "builder" ? (
             // EDITABLE overview (no embedded ProgramBuilder)
             <div className="card p-4">
               <h3 className="font-semibold">Builder</h3>
@@ -611,8 +667,8 @@ export default function CoachAthleteConsolePage() {
               </p>
 
               <div className="mt-3 space-y-6">
-                {weekDays.map(day => {
-                  const list = sessionsByDay(day);
+                {Array.from({ length: 7 }, (_, i) => addDaysISO(weekStart, i)).map(day => {
+                  const list = items.filter(it => it.session_date === day);
                   const draft = drafts[day] || { title: "", details: "" };
                   return (
                     <div key={day}>
@@ -668,7 +724,7 @@ export default function CoachAthleteConsolePage() {
                         </div>
                       </div>
 
-                      {/* Existing sessions (editable summary + tools) */}
+                      {/* Existing sessions (editable summary + Edit link) */}
                       {list.length === 0 ? (
                         <div className="text-sm mt-2" style={{ color: "var(--muted)" }}>No sessions yet.</div>
                       ) : (
@@ -682,28 +738,11 @@ export default function CoachAthleteConsolePage() {
                                   value={it.session_date}
                                   onChange={(e) => updateField(it.id, { session_date: e.target.value })}
                                 />
-                                <div className="ml-auto flex items-center gap-2" style={{ flexWrap: "wrap" }}>
+                                <div className="ml-auto flex items-center gap-2">
                                   <Link className="btn" href={`/coach-console/${athleteId}/session/${it.id}`}>Edit</Link>
-                                  <button className="btn" onClick={() => duplicateSession(it)}>Duplicate</button>
-                                  <button className="btn" onClick={() => openMove(it)}>{moveOpen[it.id] ? "Cancel Move" : "Move"}</button>
                                   <button className="btn btn-dark" onClick={() => deleteSession(it.id)}>Delete</button>
                                 </div>
                               </div>
-
-                              {/* Move inline controls */}
-                              {moveOpen[it.id] ? (
-                                <div className="mt-2 flex items-center gap-2">
-                                  <input
-                                    type="date"
-                                    className="px-2 py-1 rounded bg-white/5 border border-white/10"
-                                    value={moveTarget[it.id] || it.session_date}
-                                    onChange={(e) => setMoveTarget(prev => ({ ...prev, [it.id]: e.target.value }))}
-                                  />
-                                  <button className="btn btn-dark" onClick={() => moveSession(it)}>
-                                    Move to date
-                                  </button>
-                                </div>
-                              ) : null}
 
                               <input
                                 className="w-full mt-3 px-3 py-2 rounded bg-white/5 border border-white/10"
@@ -728,10 +767,63 @@ export default function CoachAthleteConsolePage() {
               </div>
 
               {saveError ? <div className="text-xs mt-3" style={{ color: "#fca5a5" }}>{saveError}</div> : null}
-              {toolsError ? <div className="text-xs mt-3" style={{ color: "#fca5a5" }}>{toolsError}</div> : null}
+            </div>
+          ) : (
+            // Messages tab
+            <div className="card p-4">
+              <div className="flex items-center gap-2">
+                <h3 className="font-semibold">Messages</h3>
+                {!authorized ? (
+                  <span className="text-sm ml-2" style={{ color: "var(--muted)" }}>
+                    (link to this athlete to send and receive messages)
+                  </span>
+                ) : null}
+                <span className="ml-auto text-xs" style={{ color: "var(--muted)" }}>
+                  {focusMessageId ? "Focused on a specific message" : ""}
+                </span>
+              </div>
+              <div className="mt-3">
+                <AthleteThread athleteId={athleteId} focusMessageId={focusMessageId} />
+              </div>
             </div>
           )}
         </main>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Metric card component ---------- */
+function MetricCard({
+  title,
+  unit,
+  icon,
+  current,
+  previous,
+}: {
+  title: string;
+  unit?: string;
+  icon?: React.ReactNode;
+  current: number | null;
+  previous: number | null;
+}) {
+  const tr = trendFrom(previous, current);
+  const color = tr === "up" ? "rgb(16,185,129)" : tr === "down" ? "rgb(248,113,113)" : "var(--muted)";
+  const Badge = tr === "up" ? TrendingUp : tr === "down" ? TrendingDown : Minus;
+
+  return (
+    <div className="card p-4">
+      <div className="flex items-center gap-3">
+        <div className="rounded-full p-2 bg-white/10">{icon}</div>
+        <div className="flex-1">
+          <div className="text-sm" style={{ color: "var(--muted)" }}>{title}</div>
+          <div className="text-2xl font-semibold">
+            {current != null ? current : "—"}{unit ? ` ${unit}` : ""}
+          </div>
+        </div>
+        <div title={previous != null ? `Prev: ${previous}${unit ? ` ${unit}` : ""}` : "No previous value"}>
+          <Badge className="w-5 h-5" style={{ color }} />
+        </div>
       </div>
     </div>
   );

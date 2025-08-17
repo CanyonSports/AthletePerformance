@@ -1,74 +1,34 @@
-// app/training/session/[id]/page.tsx
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
+import NavBar from "@/components/NavBar";
 import * as Supa from "@/lib/supabaseClient";
-import * as NavMod from "@/components/NavBar";
-
-const NavBar: any = (NavMod as any).default ?? (NavMod as any).NavBar ?? (() => null);
+import { CheckCircle2 } from "lucide-react";
+import { errMsg } from "@/lib/err";
 
 type PlanItem = {
   id: string;
   user_id: string;
-  sport: "climbing" | "ski" | "mtb" | "running";
   session_date: string;
   title: string;
-  details: string | null;
+  details: any | null;
   duration_min: number | null;
+  rpe: number | null;
   status: "planned" | "completed" | "skipped";
+  created_at?: string;
 };
 
-type Exercise = {
-  id: string;
-  user_id: string;
-  plan_item_id: string;
-  name: string;
-  superset_key: string | null;
-  order_index: number;
-  target_sets: number | null;
-  target_reps: number | null;
-  target_rpe: number | null;
-  target_percent_rm: number | null;
-  rec_weight_kg: number | null;
-  notes: string | null;
-  video_url: string | null;
-};
-
-type SetRow = {
-  id: string;
-  exercise_id: string;
-  set_number: number;
-  target_reps: number | null;
-  target_weight_kg: number | null;
-  target_percent_rm: number | null;
-  target_rpe: number | null;
-  actual_reps: number | null;
-  actual_weight_kg: number | null;
-  completed: boolean;
-};
-
-function ytEmbed(url: string | null) {
-  if (!url) return null;
-  try {
-    const u = new URL(url);
-    if (u.hostname.includes("youtube.com") || u.hostname.includes("youtu.be")) {
-      const id = u.searchParams.get("v") || u.pathname.replace("/", "");
-      return `https://www.youtube.com/embed/${id}`;
-    }
-    if (u.hostname.includes("vimeo.com")) {
-      const id = u.pathname.split("/").filter(Boolean).pop();
-      return `https://player.vimeo.com/video/${id}`;
-    }
-    return null;
-  } catch { return null; }
+function fromYMD(iso: string) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, (m ?? 1) - 1, d ?? 1, 12, 0, 0, 0);
 }
 
-export default function SessionDetailPage(){
+export default function AthleteSessionPage() {
   const router = useRouter();
-  const params = useParams<{ id: string }>();
-  const sessionId = params.id;
+  const params = useParams() as { id?: string };
+  const sessionId = params?.id || "";
 
   const supabase = useMemo(() => {
     const anyS = Supa as any;
@@ -76,252 +36,168 @@ export default function SessionDetailPage(){
     if (anyS.supabase) return anyS.supabase;
     return null;
   }, []);
-  const isConfigured = Boolean(supabase);
 
+  const [item, setItem] = useState<PlanItem | null>(null);
+  const [loading, setLoading] = useState(true);
   const [note, setNote] = useState("");
-  const [session, setSession] = useState<PlanItem | null>(null);
-  const [exs, setExs] = useState<Exercise[]>([]);
-  const [setsMap, setSetsMap] = useState<Record<string, SetRow[]>>({});
-  const [saving, setSaving] = useState(false);
 
-  const loadAll = useCallback(async () => {
+  const [duration, setDuration] = useState<string>("");
+  const [rpe, setRpe] = useState<string>("");
+
+  const builderDataRef = useRef<any>(null);
+
+  const loadItem = useCallback(async () => {
+    if (!supabase) return;
+    setLoading(true);
     setNote("");
-    if (!isConfigured || !supabase) return;
     try {
-      const sRes = await supabase.from("training_plan_items").select("*").eq("id", sessionId).single();
-      if (sRes.error) throw sRes.error;
-      setSession(sRes.data as PlanItem);
-
-      const eRes = await supabase
-        .from("training_exercises").select("*")
-        .eq("plan_item_id", sessionId)
-        .order("superset_key", { ascending: true, nullsFirst: true })
-        .order("order_index", { ascending: true });
-      if (eRes.error) throw eRes.error;
-      const exercises = (eRes.data || []) as Exercise[];
-      setExs(exercises);
-
-      const ids = exercises.map(e => e.id);
-      if (!ids.length) { setSetsMap({}); return; }
-      const rRes = await supabase
-        .from("training_sets").select("*")
-        .in("exercise_id", ids)
-        .order("exercise_id", { ascending: true })
-        .order("set_number", { ascending: true });
-      if (rRes.error) throw rRes.error;
-      const map: Record<string, SetRow[]> = {};
-      for (const r of (rRes.data || []) as SetRow[]) (map[r.exercise_id] ||= []).push(r);
-      setSetsMap(map);
-    } catch (e:any) {
-      setNote(e.message ?? String(e));
-    }
-  }, [isConfigured, supabase, sessionId]);
-
-  useEffect(() => { loadAll(); }, [loadAll]);
-
-  async function updateSet(row: SetRow, patch: Partial<SetRow>) {
-    if (!isConfigured || !supabase) return;
-    const next = { ...row, ...patch };
-    setSetsMap(prev => ({
-      ...prev,
-      [row.exercise_id]: (prev[row.exercise_id] || []).map(s => s.id === row.id ? next : s),
-    }));
-    const { error } = await supabase.from("training_sets").update(patch).eq("id", row.id);
-    if (error) setNote(error.message);
-  }
-
-  async function toggleComplete(row: SetRow) {
-    await updateSet(row, { completed: !row.completed });
-  }
-
-  const allSets = useMemo(() => Object.values(setsMap).flat(), [setsMap]);
-  const allDone = useMemo(() => allSets.length > 0 && allSets.every(s => s.completed), [allSets]);
-
-  async function markWorkoutComplete() {
-    if (!isConfigured || !supabase || !session) return;
-    setSaving(true);
-    try {
-      const { error } = await supabase.from("training_plan_items").update({ status: "completed" }).eq("id", session.id);
+      const { data, error } = await supabase.from("training_plan_items").select("*").eq("id", sessionId).single();
       if (error) throw error;
-      setSession({ ...session, status: "completed" });
-    } catch (e:any) {
-      setNote(e.message ?? String(e));
-    } finally { setSaving(false); }
+      setItem(data as PlanItem);
+      setDuration(data?.duration_min != null ? String(data.duration_min) : "");
+      setRpe(data?.rpe != null ? String(data.rpe) : "");
+      builderDataRef.current = data?.details ?? null;
+    } catch (e) {
+      console.error("[session] loadItem error:", e);
+      setNote(errMsg(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [supabase, sessionId]);
+
+  useEffect(() => { loadItem(); }, [loadItem]);
+
+  async function markCompleted() {
+    if (!supabase || !item) return;
+    setNote("");
+    try {
+      const d = duration.trim() ? Number(duration.trim()) : null;
+      const r = rpe.trim() ? Number(rpe.trim()) : null;
+      const { error } = await supabase
+        .from("training_plan_items")
+        .update({ status: "completed", duration_min: d, rpe: r })
+        .eq("id", item.id);
+      if (error) throw error;
+      setItem(prev => prev ? { ...prev, status: "completed", duration_min: d, rpe: r } : prev);
+    } catch (e) {
+      console.error("[session] markCompleted error:", e);
+      setNote(errMsg(e));
+    }
   }
 
-  // Group by superset_key for headings
-  const groups = useMemo(() => {
-    const g = new Map<string, Exercise[]>();
-    for (const ex of exs) {
-      const key = ex.superset_key ?? "";
-      g.set(key, [...(g.get(key) || []), ex]);
-    }
-    return Array.from(g.entries()); // [ [ 'A', [ex,ex] ], [ '', [solo...] ] ]
-  }, [exs]);
+  function renderBlocks() {
+    const d = builderDataRef.current;
+    const blocks: any[] = d?.blocks || [];
+    if (!blocks.length) return <div className="text-sm opacity-70">No structured details. Check the title & notes only.</div>;
 
-  return (
-    <div className="max-w-5xl mx-auto pb-20">
-      <NavBar />
+    return (
+      <div className="space-y-3">
+        {blocks.map((b, i) => (
+          <div key={b.id || i} className="rounded border border-white/10 p-3">
+            <div className="font-semibold">{b.title || (b.type === "strength" ? "Strength" : "Endurance")}</div>
 
-      {/* Header */}
-      <div className="mt-6 card p-4 sticky top-0 z-10 backdrop-blur supports-[backdrop-filter]:bg-black/50 bg-black/30">
-        <div className="flex items-center gap-2">
-          <Link href="/training" className="btn btn-dark">← Today</Link>
-          <div className="ml-2">
-            <div className="text-xs" style={{ color: "var(--muted)" }}>
-              {session ? new Date(session.session_date).toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" }) : "—"}
-            </div>
-            <h1 className="text-xl font-semibold">
-              {session?.title || "Session"}
-            </h1>
-          </div>
-          <div className="ml-auto text-sm">
-            <span className="px-2 py-1 rounded bg-white/10">
-              {session?.sport?.toUpperCase() ?? "—"}
-            </span>
-          </div>
-        </div>
-        {session?.details ? <p className="text-sm mt-2 opacity-80">{session.details}</p> : null}
-        {note ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{note}</div> : null}
-      </div>
-
-      {/* Exercises */}
-      <div className="mt-4 space-y-6">
-        {groups.map(([key, list]) => (
-          <div key={key || "solo"}>
-            {key ? (
-              <div className="text-xs mb-2 px-2 py-1 rounded bg-white/10 inline-block">
-                Superset {key}
+            {b.type === "endurance_intervals" && Array.isArray(b.intervals) ? (
+              <div className="mt-2 space-y-1 text-sm">
+                {b.intervals.map((row: any, idx: number) => (
+                  <div key={row.id || idx} className="rounded bg-white/5 px-2 py-1">
+                    <div className="flex items-center gap-2" style={{flexWrap:"wrap"}}>
+                      <div className="font-medium">{row.name || `Interval ${idx + 1}`}</div>
+                      <div className="ml-auto opacity-70">
+                        {row.workSec ?? 0}s / {row.restSec ?? 0}s × {row.reps ?? 1}
+                      </div>
+                    </div>
+                    {row.note ? <div className="text-xs opacity-80 mt-1">{row.note}</div> : null}
+                  </div>
+                ))}
               </div>
             ) : null}
 
-            <div className="grid gap-8">
-              {list.map(ex => {
-                const src = ytEmbed(ex.video_url);
-                const rows = setsMap[ex.id] || [];
-                return (
-                  <div key={ex.id} className="card p-4">
-                    <div className="flex items-start gap-4 flex-col md:flex-row">
-                      <div className="flex-1">
-                        <div className="flex items-center gap-2">
-                          <h3 className="font-semibold text-lg">{ex.name || "Exercise"}</h3>
-                          {ex.target_sets || ex.target_reps ? (
-                            <span className="text-xs px-2 py-0.5 rounded bg-white/10">
-                              {ex.target_sets ?? "—"} x {ex.target_reps ?? "—"}
-                            </span>
-                          ) : null}
-                          {ex.target_percent_rm ? (
-                            <span className="text-xs px-2 py-0.5 rounded bg-white/10">{ex.target_percent_rm}% 1RM</span>
-                          ) : null}
-                          {ex.target_rpe ? (
-                            <span className="text-xs px-2 py-0.5 rounded bg-white/10">RPE {ex.target_rpe}</span>
-                          ) : null}
-                          {ex.rec_weight_kg ? (
-                            <span className="text-xs px-2 py-0.5 rounded bg-white/10">{ex.rec_weight_kg} kg</span>
-                          ) : null}
-                        </div>
-                        {ex.notes ? <p className="text-sm mt-1 opacity-80">{ex.notes}</p> : null}
-                      </div>
-
-                      {/* Inline video */}
-                      <div className="w-full md:w-80 aspect-video bg-black/30 rounded overflow-hidden">
-                        {src ? (
-                          <iframe
-                            className="w-full h-full"
-                            src={src}
-                            title="demo"
-                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                            allowFullScreen
-                          />
-                        ) : ex.video_url ? (
-                          <a href={ex.video_url} target="_blank" className="block p-3 text-sm underline">
-                            Open demo video
-                          </a>
-                        ) : (
-                          <div className="p-3 text-sm opacity-70">No demo video</div>
-                        )}
+            {b.type === "strength" && Array.isArray(b.exercises) ? (
+              <div className="mt-2 space-y-1 text-sm">
+                {b.exercises.map((ex: any, idx: number) => (
+                  <div key={ex.id || idx} className="rounded bg-white/5 px-2 py-1">
+                    <div className="flex items-center gap-2" style={{flexWrap:"wrap"}}>
+                      <div className="font-medium">{ex.name || `Exercise ${idx + 1}`}</div>
+                      <div className="ml-auto opacity-70">
+                        {ex.sets ?? 0} × {ex.reps ?? "—"}{ex.rpe ? ` @ RPE ${ex.rpe}` : ""}
                       </div>
                     </div>
-
-                    {/* Sets table */}
-                    <div className="mt-4 overflow-auto">
-                      <table className="w-full text-sm">
-                        <thead>
-                          <tr className="text-left" style={{ color: "var(--muted)" }}>
-                            <th className="py-1 pr-2">Set</th>
-                            <th className="py-1 pr-2">Target</th>
-                            <th className="py-1 pr-2">Actual Reps</th>
-                            <th className="py-1 pr-2">Actual kg</th>
-                            <th className="py-1 pr-2">Done</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {rows.length === 0 ? (
-                            <tr><td colSpan={5} className="py-2 opacity-70">No sets</td></tr>
-                          ) : rows.map(r => (
-                            <tr key={r.id} className="border-t border-white/10">
-                              <td className="py-2 pr-2">{r.set_number}</td>
-                              <td className="py-2 pr-2 opacity-80">
-                                {r.target_reps ?? "—"} reps
-                                {r.target_weight_kg ? ` @ ${r.target_weight_kg} kg` : ""}
-                                {r.target_percent_rm ? ` (${r.target_percent_rm}% 1RM)` : ""}
-                                {r.target_rpe ? `, RPE ${r.target_rpe}` : ""}
-                              </td>
-                              <td className="py-2 pr-2">
-                                <input
-                                  className="field w-24"
-                                  type="number"
-                                  value={r.actual_reps ?? ""}
-                                  placeholder="reps"
-                                  onChange={e => updateSet(r, { actual_reps: e.target.value === "" ? null : Number(e.target.value) })}
-                                />
-                              </td>
-                              <td className="py-2 pr-2">
-                                <input
-                                  className="field w-24"
-                                  type="number"
-                                  step={0.5}
-                                  value={r.actual_weight_kg ?? ""}
-                                  placeholder="kg"
-                                  onChange={e => updateSet(r, { actual_weight_kg: e.target.value === "" ? null : Number(e.target.value) })}
-                                />
-                              </td>
-                              <td className="py-2 pr-2">
-                                <label className="inline-flex items-center gap-2">
-                                  <input
-                                    type="checkbox"
-                                    checked={r.completed}
-                                    onChange={() => toggleComplete(r)}
-                                  />
-                                  <span className="opacity-80">Complete</span>
-                                </label>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
+                    {ex.notes ? <div className="text-xs opacity-80 mt-1">{ex.notes}</div> : null}
                   </div>
-                );
-              })}
-            </div>
+                ))}
+              </div>
+            ) : null}
           </div>
         ))}
       </div>
+    );
+  }
 
-      {/* Footer actions */}
-      <div className="fixed bottom-0 left-0 right-0 backdrop-blur supports-[backdrop-filter]:bg-black/50 bg-black/30 border-t border-white/10">
-        <div className="max-w-5xl mx-auto p-3 flex items-center gap-2">
-          <Link href="/training" className="btn">Back</Link>
-          <div className="ml-auto flex items-center gap-3">
-            <div className="text-sm opacity-80">
-              {allSets.length ? `${allSets.filter(s=>s.completed).length}/${allSets.length} sets complete` : "No sets"}
-            </div>
-            <button className="btn btn-dark" disabled={!allDone || saving} onClick={markWorkoutComplete}>
-              {saving ? "Saving…" : "Mark workout complete"}
-            </button>
+  return (
+    <div className="max-w-3xl mx-auto pb-20">
+      <NavBar />
+
+      <div className="mt-6 card p-4">
+        <div className="flex items-center gap-2" style={{flexWrap:"wrap"}}>
+          <Link href="/training" className="btn">← Back</Link>
+          <div className="ml-auto text-sm" style={{ color: "var(--muted)" }}>
+            {item?.session_date ? fromYMD(item.session_date).toLocaleDateString() : ""}
           </div>
         </div>
+
+        {loading ? (
+          <div className="mt-3">Loading…</div>
+        ) : !item ? (
+          <div className="mt-3 text-red-400 text-sm">{note || "Session not found."}</div>
+        ) : (
+          <div className="mt-3 space-y-4">
+            <div className="flex items-center gap-2" style={{flexWrap:"wrap"}}>
+              <h1 className="text-xl font-semibold">{item.title}</h1>
+              <span className="text-xs ml-2 px-2 py-[2px] rounded bg-white/10" style={{ color: "var(--muted)" }}>
+                {item.status}
+              </span>
+            </div>
+
+            <div className="grid md:grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <div className="text-xs" style={{ color: "var(--muted)" }}>Duration (min)</div>
+                <input
+                  className="w-full px-3 py-2 rounded bg-white/5 border border-white/10"
+                  inputMode="numeric"
+                  value={duration}
+                  onChange={e => setDuration(e.target.value.replace(/[^0-9]/g, ""))}
+                  placeholder="60"
+                />
+              </div>
+              <div className="space-y-1">
+                <div className="text-xs" style={{ color: "var(--muted)" }}>RPE (1–10)</div>
+                <input
+                  className="w-full px-3 py-2 rounded bg-white/5 border border-white/10"
+                  inputMode="numeric"
+                  value={rpe}
+                  onChange={e => setRpe(e.target.value.replace(/[^0-9]/g, ""))}
+                  placeholder="7"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+             <Link className="btn" href={`/training/timer/${sessionId}`}>
+  Start Workout
+</Link>
+
+              <button className="btn btn-dark" onClick={markCompleted}>
+                <CheckCircle2 className="w-4 h-4 mr-1" /> Mark Completed
+              </button>
+              {note ? <span className="text-xs" style={{ color: "#fca5a5" }}>{note}</span> : null}
+            </div>
+
+            <div className="pt-2">
+              <div className="text-sm font-semibold">Plan</div>
+              <div className="mt-2">{renderBlocks()}</div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

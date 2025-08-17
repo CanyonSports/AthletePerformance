@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { getSupabase } from "@/lib/supabaseClient";
+import NotificationsBell from "@/components/NotificationsBell";
 
 type Role = "athlete" | "coach" | "admin";
 
@@ -52,7 +53,9 @@ export default function NavBar() {
 
       {/* Center nav */}
       <div className="ml-4 flex items-center gap-2">
+
         {/* Athlete nav (keep Training + Log a Test) */}
+       
         {!loading && role === "athlete" && (
           <>
             <Link href="/dashboard" className={`btn ${pathname === "/dashboard" ? "btn-dark" : ""}`}>Dashboard</Link>
@@ -72,6 +75,8 @@ export default function NavBar() {
 
       {/* Right side */}
       <div className="ml-auto flex items-center gap-2">
+        
+         <NotificationsBell />
         {loading ? (
           <div className="text-xs text-slate-400">Loading…</div>
         ) : (
@@ -83,6 +88,7 @@ export default function NavBar() {
             )}
             <button className="btn" onClick={logout}>Sign out</button>
           </>
+          
         )}
       </div>
     </div>
