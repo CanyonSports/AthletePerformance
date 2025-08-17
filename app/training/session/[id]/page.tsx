@@ -8,6 +8,7 @@ import NavBar from "@/components/NavBar";
 import * as Supa from "@/lib/supabaseClient";
 import { CheckCircle2, Play, RotateCcw, SkipForward, Timer, ChevronRight } from "lucide-react";
 import { errMsg } from "@/lib/err";
+import SessionMetrics from "@/components/SessionMetrics";
 
 /* ---------- Types ---------- */
 type PlanItem = {
@@ -668,6 +669,9 @@ export default function AthleteSessionPage() {
               <h1 className="text-xl md:text-2xl font-semibold">{item.title}</h1>
               <StatusPill status={item.status} />
             </div>
+            <div className="mt-2">
+  <SessionMetrics planItemId={item.id} />
+</div>
 
             {/* Overview chips */}
             <div className="flex items-center gap-2 flex-wrap">
