@@ -3,6 +3,7 @@
 
 import { useEffect, useMemo, useState, useRef, useCallback } from "react";
 import * as Supa from "@/lib/supabaseClient";
+import ColumnsToggle from "@/components/Coach/ColumnsToggle";
 
 /** ───────────────────────── Types ───────────────────────── */
 type Block = {
@@ -44,6 +45,8 @@ export default function StrengthEditor({ planItemId }: Props) {
     return null;
   }, []);
   const isConfigured = Boolean(supabase);
+
+  
 
   /** Data state (authoritative for the UI) */
   const [blocks, setBlocks] = useState<Block[]>([]);
