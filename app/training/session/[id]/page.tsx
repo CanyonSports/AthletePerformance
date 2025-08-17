@@ -24,6 +24,7 @@ type PlanItem = {
 
 type StrengthSet = {
   id?: string;
+  exercise_id?: string;          // typed for mapping
   set_index?: number;
   target_reps?: number | null;
   target_percent_rm?: number | null;
@@ -42,7 +43,6 @@ type StrengthExercise = {
   sets: StrengthSet[];
 };
 
-/** Endurance rows follow your EnduranceEditor schema */
 type EnduranceRow = {
   id?: string;
   block?: "warmup" | "main" | "cooldown";
@@ -146,7 +146,7 @@ export default function AthleteSessionPage() {
   const [loading, setLoading] = useState(true);
   const [note, setNote] = useState("");
 
-  // Inputs
+  // Inputs (kept for completion; inputs hidden in overview)
   const [duration, setDuration] = useState<string>("");
   const [rpe, setRpe] = useState<string>("");
 
@@ -158,6 +158,27 @@ export default function AthleteSessionPage() {
   const blocks: Block[] = useMemo(() => builderDataRef.current?.blocks ?? [], [builderDataRef.current]);
   const plannedMinutes = useMemo(() => estimatePlannedMinutes(blocks), [blocks]);
 
+  // Overview counters
+  const overviewSummary = useMemo(() => {
+    let strengthExercises = 0;
+    let strengthSets = 0;
+    let intervalRows = 0;
+
+    blocks.forEach((b) => {
+      if (b.type === "strength") {
+        const exs = b.exercises ?? [];
+        strengthExercises += exs.length;
+        exs.forEach((ex) => {
+          strengthSets += ex.sets?.length ?? 0;
+        });
+      } else if (b.type === "endurance") {
+        intervalRows += b.intervals?.length ?? 0;
+      }
+    });
+
+    return { strengthExercises, strengthSets, intervalRows };
+  }, [blocks]);
+
   /* ---------- Fetch & assemble program ---------- */
   const loadStructuredProgram = useCallback(
     async (planId: string, details: any) => {
@@ -168,7 +189,7 @@ export default function AthleteSessionPage() {
         ? (parsed.sectionOrder.filter((s: unknown): s is SectionType => s === "endurance" || s === "strength"))
         : undefined;
 
-      // Endurance: training_intervals (group by block)
+      // Endurance
       const { data: ints } = await supabase
         .from("training_intervals")
         .select("id,block,order_index,repeats,mode,duration_sec,distance_m,target_type,target_low,target_high,notes")
@@ -185,7 +206,7 @@ export default function AthleteSessionPage() {
       if (main.length)   enduranceBlocks.push({ type: "endurance", title: "Main Set", blockKind: "main", intervals: main });
       if (cool.length)   enduranceBlocks.push({ type: "endurance", title: "Cool-down", blockKind: "cooldown", intervals: cool });
 
-      // Strength: blocks, exercises, sets
+      // Strength
       const { data: blocksRaw } = await supabase
         .from("strength_blocks")
         .select("id,title,order_index")
@@ -216,6 +237,7 @@ export default function AthleteSessionPage() {
           setsByExercise = (setsRows ?? []).reduce((acc: Record<string, StrengthSet[]>, s: any) => {
             (acc[s.exercise_id] ??= []).push({
               id: s.id,
+              exercise_id: s.exercise_id,
               set_index: s.set_index,
               target_reps: s.target_reps,
               target_percent_rm: s.target_percent_rm,
@@ -265,7 +287,6 @@ export default function AthleteSessionPage() {
         if (sec === "strength" && hasStrength) assembled.push(...strengthBlocks);
       });
 
-      // Fallback: legacy JSON in details.blocks
       const legacyBlocks: Block[] = Array.isArray(parsed?.blocks) ? (parsed.blocks as any) : [];
       const finalBlocks = assembled.length ? assembled : legacyBlocks;
 
@@ -648,40 +669,20 @@ export default function AthleteSessionPage() {
               <StatusPill status={item.status} />
             </div>
 
-            {/* Quick metrics */}
-            <div className="grid sm:grid-cols-2 gap-3">
-              <div className="rounded-xl bg-white/5 p-3">
-                <div className="text-xs" style={{ color: "var(--muted)" }}>Duration (min)</div>
-                <div className="mt-1 flex items-center gap-2">
-                  <input
-                    className="w-full px-3 py-2 rounded bg-white/5 border border-white/10"
-                    inputMode="numeric"
-                    value={duration}
-                    onChange={e => setDuration(e.target.value.replace(/[^0-9]/g, ""))}
-                    placeholder={plannedMinutes ? String(plannedMinutes) : "60"}
-                  />
-                  {plannedMinutes ? (
-                    <button className="btn btn-dark text-xs whitespace-nowrap"
-                            onClick={() => setDuration(String(plannedMinutes))}
-                            title="Use planned">
-                      Use {plannedMinutes}
-                    </button>
-                  ) : null}
-                </div>
-              </div>
-
-              <div className="rounded-xl bg-white/5 p-3">
-                <div className="text-xs" style={{ color: "var(--muted)" }}>RPE (1–10)</div>
-                <div className="mt-1">
-                  <input type="range" min={1} max={10} value={Number(rpe || 7)} onChange={e => setRpe(String(e.target.value))} className="w-full" />
-                  <div className="mt-1 flex items-center justify-between text-xs opacity-80">
-                    {[1,3,5,7,9,10].map(v => (
-                      <button key={v} className="px-2 py-0.5 rounded bg-white/10" onClick={() => setRpe(String(v))}>{v}</button>
-                    ))}
-                    <span className="ml-2 text-xs">Selected: <strong>{rpe || 7}</strong></span>
-                  </div>
-                </div>
-              </div>
+            {/* Overview chips */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="px-2 py-1 rounded bg-white/10 text-xs">
+                {plannedMinutes ? `${plannedMinutes} min` : "— min"}
+              </span>
+              <span className="px-2 py-1 rounded bg-white/10 text-xs">
+                {overviewSummary.strengthExercises} strength exercises
+              </span>
+              <span className="px-2 py-1 rounded bg-white/10 text-xs">
+                {overviewSummary.strengthSets} sets
+              </span>
+              <span className="px-2 py-1 rounded bg-white/10 text-xs">
+                {overviewSummary.intervalRows} endurance intervals
+              </span>
             </div>
 
             {/* Overall progress */}
@@ -714,6 +715,12 @@ export default function AthleteSessionPage() {
       >
         <div className="max-w-3xl mx-auto px-3 py-3">
           <div className="flex items-center gap-2" style={{ flexWrap: "wrap" }}>
+            {/* NEW: Start Training (interactive logging page) */}
+            <Link className="btn" href={`/training/workout/${sessionId}`}>
+              <Play className="w-4 h-4 mr-1" /> Start Training
+            </Link>
+
+            {/* Existing timer shortcut */}
             <Link className="btn" href={`/training/timer/${sessionId}`}>
               <Play className="w-4 h-4 mr-1" /> Start Timer
             </Link>
