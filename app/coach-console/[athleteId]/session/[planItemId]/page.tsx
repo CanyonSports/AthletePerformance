@@ -8,18 +8,16 @@ import NavBar from "@/components/NavBar";
 import EnduranceEditor from "@/components/EnduranceEditor";
 import * as Supa from "@/lib/supabaseClient";
 
-type Sport = "climbing" | "ski" | "mtb" | "running";
-
 type PlanItem = {
   id: string;
   user_id: string;
-  sport: Sport;
   session_date: string; // yyyy-mm-dd
   title: string;
   details: string | null;
   duration_min: number | null;
   rpe: number | null;
   status: "planned" | "completed" | "skipped";
+  sport?: string | null; // optional, unused in UI
 };
 
 export default function CoachSessionAuthorPage() {
@@ -90,7 +88,7 @@ export default function CoachSessionAuthorPage() {
         <div className="card p-4 mt-4">Loading…</div>
       ) : (
         <>
-          {/* Metadata editor */}
+          {/* Metadata editor (no sport control) */}
           <div className="card p-4 mt-4">
             <h3 className="font-semibold">Session Details</h3>
             <div className="grid md:grid-cols-2 gap-3 mt-3">
@@ -102,20 +100,6 @@ export default function CoachSessionAuthorPage() {
                   value={item.session_date}
                   onChange={(e) => updateField({ session_date: e.target.value })}
                 />
-              </div>
-
-              <div className="grid gap-2">
-                <label className="text-sm" style={{ color: "var(--muted)" }}>Sport</label>
-                <select
-                  className="px-3 py-2 rounded bg-white/5 border border-white/10"
-                  value={item.sport}
-                  onChange={(e) => updateField({ sport: e.target.value as Sport })}
-                >
-                  <option value="climbing">Climbing</option>
-                  <option value="ski">Ski</option>
-                  <option value="mtb">MTB</option>
-                  <option value="running">Running</option>
-                </select>
               </div>
             </div>
 
@@ -141,26 +125,18 @@ export default function CoachSessionAuthorPage() {
             </div>
           </div>
 
-          {/* Structured content */}
-          {(item.sport === "running" || item.sport === "mtb" || item.sport === "ski") ? (
-            <div className="card p-4 mt-4">
-              <h3 className="font-semibold">Intervals</h3>
-              <p className="text-sm" style={{ color: "var(--muted)" }}>
-                Add warm-up, work blocks, recoveries, cool-down. Saves automatically.
-              </p>
-              <div className="mt-3">
-                <EnduranceEditor planItemId={item.id} athleteId={item.user_id} />
-              </div>
+          {/* Structured content (always available) */}
+          <div className="card p-4 mt-4">
+            <h3 className="font-semibold">Structured Content</h3>
+            <p className="text-sm" style={{ color: "var(--muted)" }}>
+              Add intervals/blocks. Saves automatically.
+            </p>
+            <div className="mt-3">
+              <EnduranceEditor planItemId={item.id} athleteId={item.user_id} />
             </div>
-          ) : (
-            <div className="card p-4 mt-4">
-              <h3 className="font-semibold">Strength / Climbing Builder</h3>
-              <p className="text-sm" style={{ color: "var(--muted)" }}>
-                Coming next: exercise blocks, supersets, %1RM/RPE, recommended loads, and demo videos.
-              </p>
-              {/* Hook in your resistance builder component here when ready */}
-            </div>
-          )}
+          </div>
+
+          {/* TODO: Strength / Climbing Builder panel can go here */}
         </>
       )}
     </div>

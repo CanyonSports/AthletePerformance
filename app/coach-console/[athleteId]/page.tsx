@@ -1,7 +1,7 @@
 // app/coach-console/[athleteId]/page.tsx
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import NavBar from "@/components/NavBar";
@@ -10,20 +10,11 @@ import TemplatesPanel from "@/components/TemplatesPanel";
 import EnduranceEditor from "@/components/EnduranceEditor";
 import * as Supa from "@/lib/supabaseClient";
 
-type Sport = "climbing" | "ski" | "mtb" | "running";
-
-type Profile = {
-  id: string;
-  email: string | null;
-  display_name: string | null;
-  role: "athlete" | "coach" | "admin" | null;
-};
-
+/* ---------- Types ---------- */
 type PlanItem = {
   id: string;
   user_id: string;
-  sport: Sport;
-  session_date: string; // yyyy-mm-dd (local)
+  session_date: string; // yyyy-mm-dd
   title: string;
   details: string | null;
   duration_min: number | null;
@@ -32,7 +23,14 @@ type PlanItem = {
   created_at?: string;
 };
 
-/* ---------- Local date helpers (avoid UTC drift) ---------- */
+type Profile = {
+  id: string;
+  email: string | null;
+  display_name: string | null;
+  role: "athlete" | "coach" | "admin" | null;
+};
+
+/* ---------- Local-date helpers (avoid UTC drift) ---------- */
 function ymd(d: Date) {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -48,11 +46,11 @@ function addDaysISO(iso: string, days: number) {
   d.setDate(d.getDate() + days);
   return ymd(d);
 }
-function startOfWeekISO_local(d: Date) {
-  const copy = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  const day = (copy.getDay() + 6) % 7; // Monday=0
-  copy.setDate(copy.getDate() - day);
-  return ymd(copy);
+function startOfWeekISO(d: Date) {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const day = (x.getDay() + 6) % 7; // Monday=0
+  x.setDate(x.getDate() - day);
+  return ymd(x);
 }
 function weekdayLabel(iso: string) {
   return fromYMD(iso).toLocaleDateString(undefined, { weekday: "long" });
@@ -61,72 +59,83 @@ function weekdayLabel(iso: string) {
 export default function CoachAthleteConsolePage() {
   const { athleteId } = useParams<{ athleteId: string }>();
 
-  // Supabase (supports either getSupabase() or supabase export)
+  // Supabase: support either getSupabase() or exported supabase constant
   const supabase = useMemo(() => {
     const anyS = Supa as any;
-    try { if (typeof anyS.getSupabase === "function") return anyS.getSupabase(); } catch {}
+    try {
+      if (typeof anyS.getSupabase === "function") return anyS.getSupabase();
+    } catch {}
     if (anyS.supabase) return anyS.supabase;
     return null;
   }, []);
   const isConfigured = Boolean(supabase);
 
-  const [note, setNote] = useState("");
+  // State
   const [me, setMe] = useState<Profile | null>(null);
   const [athlete, setAthlete] = useState<Profile | null>(null);
   const [authorized, setAuthorized] = useState<boolean>(false);
 
-  const [sport, setSport] = useState<Sport>("climbing");
-  const [weekStart, setWeekStart] = useState<string>(startOfWeekISO_local(new Date()));
+  const [weekStart, setWeekStart] = useState<string>(startOfWeekISO(new Date()));
   const [items, setItems] = useState<PlanItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [newDate, setNewDate] = useState<string>(weekStart);
 
-  // NEW: tab to switch read-only sessions vs editable builder
   const [activeTab, setActiveTab] = useState<"sessions" | "builder">("sessions");
-
-  // NEW: per-day drafts for quick add { [iso]: { title, details } }
   const [drafts, setDrafts] = useState<Record<string, { title: string; details: string }>>({});
 
-  /* ---------- Load coach + athlete + authorization ---------- */
+  // targeted errors
+  const [headerError, setHeaderError] = useState("");
+  const [addError, setAddError] = useState("");
+  const [saveError, setSaveError] = useState("");
+  const [deleteError, setDeleteError] = useState("");
+
+  // throttle realtime after optimistic writes
+  const lastMutationRef = useRef<number>(0);
+
+  /* ---------- Load me + athlete + authorization (ALWAYS checks link) ---------- */
   const loadWho = useCallback(async () => {
-    setNote("");
+    setHeaderError("");
     if (!isConfigured || !supabase) return;
 
     try {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { setNote("Please sign in."); return; }
+      const { data: { user }, error: userErr } = await supabase.auth.getUser();
+      if (userErr) throw userErr;
+      if (!user) { setHeaderError("Please sign in."); return; }
 
+      // me (profile)
       const meRes = await supabase.from("profiles").select("*").eq("id", user.id).single();
       if (meRes.error) throw meRes.error;
       setMe(meRes.data as Profile);
 
+      // athlete (profile)
       const aRes = await supabase.from("profiles").select("*").eq("id", athleteId).single();
       if (aRes.error) throw aRes.error;
       setAthlete(aRes.data as Profile);
 
-      let ok = (meRes.data?.role === "coach" || meRes.data?.role === "admin");
-      if (ok && meRes.data?.role === "coach") {
-        const linkRes = await supabase
-          .from("coach_athletes")
-          .select("id")
-          .eq("coach_id", user.id)
-          .eq("athlete_id", athleteId)
-          .maybeSingle();
-        ok = Boolean(linkRes.data);
-      }
+      // 🔑 ALWAYS check link (not gated by role string)
+      const link = await supabase
+        .from("coach_athletes")
+        .select("coach_id, athlete_id")
+        .eq("coach_id", meRes.data.id)
+        .eq("athlete_id", athleteId)
+        .maybeSingle();
+
+      // ✅ Authorized if admin OR link exists
+      const ok = (meRes.data?.role === "admin") || Boolean(link.data);
       setAuthorized(ok);
-      if (!ok) setNote("You are not linked to this athlete.");
+      if (!ok) setHeaderError("You are not linked to this athlete. Click the button below to link.");
     } catch (e: any) {
-      setNote(e.message ?? String(e));
+      setHeaderError(e.message ?? String(e));
     }
   }, [isConfigured, supabase, athleteId]);
 
   useEffect(() => { loadWho(); }, [loadWho]);
 
-  /* ---------- Load week sessions ---------- */
+  /* ---------- Load week plan ---------- */
   const loadWeek = useCallback(async () => {
     if (!isConfigured || !supabase || !athleteId) return;
     setLoading(true);
+    setAddError(""); setSaveError(""); setDeleteError("");
     try {
       const end = addDaysISO(weekStart, 7);
       const { data, error } = await supabase
@@ -136,11 +145,12 @@ export default function CoachAthleteConsolePage() {
         .gte("session_date", weekStart)
         .lt("session_date", end)
         .order("session_date", { ascending: true });
+
       if (error) throw error;
       setItems((data || []) as PlanItem[]);
       if (newDate < weekStart || newDate >= end) setNewDate(weekStart);
-    } catch (e: any) {
-      setNote(e.message ?? String(e));
+    } catch (e:any) {
+      setHeaderError(e.message ?? String(e));
     } finally {
       setLoading(false);
     }
@@ -157,7 +167,11 @@ export default function CoachAthleteConsolePage() {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "training_plan_items", filter: `user_id=eq.${athleteId}` },
-        () => { if (mounted) loadWeek(); }
+        () => {
+          const now = Date.now();
+          if (now - lastMutationRef.current < 400) return;
+          if (mounted) loadWeek();
+        }
       )
       .subscribe();
     return () => {
@@ -166,28 +180,20 @@ export default function CoachAthleteConsolePage() {
     };
   }, [isConfigured, supabase, athleteId, loadWeek]);
 
-  /* ---------- Mutations ---------- */
-  async function linkMeToAthlete() {
-    if (!isConfigured || !supabase || !athleteId) return;
-    try {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) throw new Error("Sign in required");
-      const { error } = await supabase
-        .from("coach_athletes")
-        .insert({ coach_id: user.id, athlete_id: athleteId });
-      if (error) throw error;
-      setAuthorized(true);
-      setNote("Linked! You now manage this athlete.");
-    } catch (e:any) {
-      setNote(e.message ?? String(e));
-    }
+  /* ---------- Mutations (optimistic) ---------- */
+  function sortByDate(list: PlanItem[]) {
+    return [...list].sort((a, b) => a.session_date.localeCompare(b.session_date));
   }
 
   async function addSessionOn(dateISO: string, title: string, details: string) {
-    if (!isConfigured || !supabase || !athleteId) return;
-    const row: Omit<PlanItem, "id"> = {
+    setAddError("");
+    if (!isConfigured || !supabase) { setAddError("Supabase not configured."); return; }
+    if (!dateISO) { setAddError("Pick a date first."); return; }
+
+    const tempId = `temp-${Math.random().toString(36).slice(2)}`;
+    const temp: PlanItem = {
+      id: tempId,
       user_id: athleteId,
-      sport,
       session_date: dateISO,
       title: title || "New Session",
       details: details || "",
@@ -195,20 +201,102 @@ export default function CoachAthleteConsolePage() {
       rpe: null,
       status: "planned",
     };
-    const { error } = await supabase.from("training_plan_items").insert(row as any);
-    if (error) setNote(error.message);
-    else await loadWeek();
+
+    // optimistic
+    setItems(prev => sortByDate([...prev, temp]));
+    lastMutationRef.current = Date.now();
+
+    try {
+      const { data, error } = await supabase
+        .from("training_plan_items")
+        .insert({
+          user_id: athleteId,
+          session_date: dateISO,
+          title: temp.title,
+          details: temp.details,
+          duration_min: null,
+          rpe: null,
+          status: "planned",
+        })
+        .select("*")
+        .single();
+      if (error) throw error;
+
+      // replace temp with real
+      setItems(prev => sortByDate(prev.map(x => (x.id === tempId ? (data as PlanItem) : x))));
+      setDrafts(d => ({ ...d, [dateISO]: { title: "", details: "" } }));
+    } catch (e:any) {
+      // revert
+      setItems(prev => prev.filter(x => x.id !== tempId));
+      setAddError(e.message ?? String(e));
+    }
   }
 
   async function updateField(id: string, patch: Partial<PlanItem>) {
-    if (!isConfigured || !supabase) return;
+    setSaveError("");
+    if (!isConfigured || !supabase) { setSaveError("Supabase not configured."); return; }
+
+    const before = items;
+    setItems(prev => {
+      const next = prev.map(it => (it.id === id ? { ...it, ...patch } as PlanItem : it));
+      return "session_date" in (patch as any) ? sortByDate(next) : next;
+    });
+    lastMutationRef.current = Date.now();
+
     const { error } = await supabase.from("training_plan_items").update(patch).eq("id", id);
-    if (error) setNote(error.message);
+    if (error) {
+      setItems(before); // revert
+      setSaveError(error.message ?? String(error));
+    }
   }
+
   async function deleteSession(id: string) {
-    if (!isConfigured || !supabase) return;
+    setDeleteError("");
+    if (!isConfigured || !supabase) { setDeleteError("Supabase not configured."); return; }
+
+    const before = items;
+    setItems(prev => prev.filter(it => it.id !== id));
+    lastMutationRef.current = Date.now();
+
     const { error } = await supabase.from("training_plan_items").delete().eq("id", id);
-    if (error) setNote(error.message);
+    if (error) {
+      setItems(before);
+      setDeleteError(error.message ?? String(error));
+    }
+  }
+
+  /* ---------- Link button (idempotent; verify read after) ---------- */
+  async function linkMeToAthlete() {
+    try {
+      if (!supabase) throw new Error("Supabase not configured");
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error("Sign in required");
+
+      // Create if missing; ignore if existing
+      const { error } = await supabase
+        .from("coach_athletes")
+        .upsert(
+          { coach_id: user.id, athlete_id: athleteId },
+          { onConflict: "coach_id,athlete_id" } // treat 23505 as success in older stacks
+        );
+      if (error && error.code !== "23505") throw error;
+
+      // Verify readability (RLS)
+      const check = await supabase
+        .from("coach_athletes")
+        .select("coach_id, athlete_id")
+        .eq("coach_id", user.id)
+        .eq("athlete_id", athleteId)
+        .maybeSingle();
+      if (check.error) throw check.error;
+
+      const ok = Boolean(check.data);
+      setAuthorized(ok);
+      setHeaderError(ok ? "" : "Linked, but cannot read coach_athletes (RLS).");
+      await loadWeek();
+    } catch (e:any) {
+      setHeaderError(e.message ?? String(e));
+    }
   }
 
   /* ---------- Derived ---------- */
@@ -232,39 +320,38 @@ export default function CoachAthleteConsolePage() {
           </div>
           <div className="ml-auto flex items-center gap-3">
             <WeekPicker value={weekStart} onChange={(v) => setWeekStart(v)} />
-            <select
-              className="px-3 py-2 rounded bg-white/5 border border-white/10"
-              value={sport}
-              onChange={(e) => setSport(e.target.value as Sport)}
-              title="Sport context for new sessions"
-            >
-              <option value="climbing">Climbing</option>
-              <option value="ski">Ski</option>
-              <option value="mtb">MTB</option>
-              <option value="running">Running</option>
-            </select>
           </div>
         </div>
 
-        {note ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{note}</div> : null}
-        {me && (me.role === "coach" || me.role === "admin") && !authorized ? (
+        {/* Debug chips */}
+        <div className="mt-2 text-xs" style={{ display:"flex", gap:12, flexWrap:"wrap", color:"var(--muted)" }}>
+          <span>User: {me?.id?.slice(0,8) || "?"}</span>
+          <span>Role: {me?.role || "?"}</span>
+          <span>Athlete: {athleteId?.slice(0,8) || "?"}</span>
+          <span>Authorized: {authorized ? "yes" : "no"}</span>
+        </div>
+
+        {headerError ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{headerError}</div> : null}
+
+        {/* Always show link button if not authorized */}
+        {!authorized && (
           <div className="mt-2">
             <button className="btn btn-dark" onClick={linkMeToAthlete}>Link me to this athlete</button>
             <span className="text-xs ml-3" style={{ color: "var(--muted)" }}>
               Creates a coach_athletes link so you can manage this athlete.
             </span>
           </div>
-        ) : null}
+        )}
       </div>
 
-      {/* Two columns: Left = Templates; Right = Sessions OR Builder */}
+      {/* Two columns: Left = Templates + Add, Right = Tabs */}
       <div className="mt-4 grid" style={{ gridTemplateColumns: "minmax(280px, 360px) 1fr", gap: 16 }}>
-        {/* LEFT: Templates & quick add (unchanged) */}
+        {/* LEFT */}
         <aside className="flex flex-col gap-3">
           <div className="card p-4">
             <h3 className="font-semibold">Add Session</h3>
             <p className="text-sm" style={{ color: "var(--muted)" }}>
-              Choose a date and create a new session (uses selected sport).
+              Pick a date and create a new session.
             </p>
             <div className="mt-3 flex items-center gap-2">
               <input
@@ -273,23 +360,21 @@ export default function CoachAthleteConsolePage() {
                 value={newDate}
                 onChange={(e) => setNewDate(e.target.value || weekStart)}
               />
-              <button className="btn btn-dark" onClick={() => addSessionOn(newDate, "New Session", "")} disabled={!authorized}>
+              <button
+                className="btn btn-dark"
+                onClick={() => addSessionOn(newDate, "New Session", "")}
+              >
                 + Add Session
               </button>
             </div>
+            {addError ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{addError}</div> : null}
           </div>
 
-          <TemplatesPanel
-            athleteId={athleteId}
-            sport={sport}
-            weekStart={weekStart}
-            onApplied={() => loadWeek()}
-          />
         </aside>
 
-        {/* RIGHT: Tabs */}
+        {/* RIGHT */}
         <main className="flex flex-col gap-3">
-          {/* Tab switcher */}
+          {/* Tabs */}
           <div className="card p-3">
             <div className="tabs">
               <button
@@ -307,7 +392,7 @@ export default function CoachAthleteConsolePage() {
             </div>
           </div>
 
-          {/* Tab: READ-ONLY Week Sessions */}
+          {/* READ-ONLY list (name/description + Edit/Delete) */}
           {activeTab === "sessions" ? (
             <div className="card p-4">
               <div className="flex items-center gap-2">
@@ -340,15 +425,9 @@ export default function CoachAthleteConsolePage() {
                                   <button className="btn btn-dark" onClick={() => deleteSession(it.id)}>Delete</button>
                                 </div>
                               </div>
-                              {it.details ? (
-                                <div className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-                                  {it.details}
-                                </div>
-                              ) : (
-                                <div className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-                                  (No description)
-                                </div>
-                              )}
+                              <div className="text-sm mt-1" style={{ color: "var(--muted)" }}>
+                                {it.details || "(No description)"}
+                              </div>
                             </div>
                           ))}
                         </div>
@@ -357,9 +436,10 @@ export default function CoachAthleteConsolePage() {
                   );
                 })}
               </div>
+              {deleteError ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{deleteError}</div> : null}
             </div>
           ) : (
-            // Tab: EDITABLE BUILDER VIEW (now WITH per-day quick-add)
+            // EDITABLE view (inline edits + per-day quick add + EnduranceEditor)
             <div className="card p-4">
               <h3 className="font-semibold">Builder</h3>
               <p className="text-sm" style={{ color: "var(--muted)" }}>
@@ -379,7 +459,7 @@ export default function CoachAthleteConsolePage() {
                         <div className="ml-auto text-xs" style={{ color: "var(--muted)" }}>{day}</div>
                       </div>
 
-                      {/* Per-day quick add (title + description) */}
+                      {/* Quick add */}
                       <div className="mt-2 card p-3">
                         <div className="grid" style={{ gap: 8 }}>
                           <input
@@ -402,15 +482,11 @@ export default function CoachAthleteConsolePage() {
                           <div className="flex gap-2">
                             <button
                               className="btn btn-dark"
-                              onClick={() => {
-                                addSessionOn(day, draft.title.trim(), draft.details.trim());
-                                setDrafts((d) => ({ ...d, [day]: { title: "", details: "" } }));
-                              }}
-                              disabled={!authorized || draft.title.trim().length === 0}
+                              onClick={() => addSessionOn(day, draft.title.trim(), draft.details.trim())}
+                              disabled={draft.title.trim().length === 0}
                             >
                               + Add to {weekdayLabel(day)}
                             </button>
-                            {/* Optional: clear */}
                             {(draft.title || draft.details) ? (
                               <button
                                 className="btn"
@@ -420,10 +496,11 @@ export default function CoachAthleteConsolePage() {
                               </button>
                             ) : null}
                           </div>
+                          {addError ? <div className="text-xs" style={{ color: "#fca5a5" }}>{addError}</div> : null}
                         </div>
                       </div>
 
-                      {/* Existing sessions (editable + Edit link) */}
+                      {/* Existing sessions (editable + structured editor) */}
                       {list.length === 0 ? (
                         <div className="text-sm mt-2" style={{ color: "var(--muted)" }}>No sessions yet.</div>
                       ) : (
@@ -431,7 +508,6 @@ export default function CoachAthleteConsolePage() {
                           {list.map(it => (
                             <div key={it.id} className="card p-3">
                               <div className="flex items-center gap-2" style={{ flexWrap: "wrap" }}>
-                                {/* Move between days */}
                                 <input
                                   type="date"
                                   className="px-2 py-1 rounded bg-white/5 border border-white/10"
@@ -444,7 +520,6 @@ export default function CoachAthleteConsolePage() {
                                 </div>
                               </div>
 
-                              {/* Editable title & description */}
                               <input
                                 className="w-full mt-3 px-3 py-2 rounded bg-white/5 border border-white/10"
                                 placeholder="Title"
@@ -459,12 +534,12 @@ export default function CoachAthleteConsolePage() {
                                 onChange={(e) => updateField(it.id, { details: e.target.value })}
                               />
 
-                              {/* Endurance intervals editor for endurance sports */}
-                              {(it.sport === "running" || it.sport === "mtb" || it.sport === "ski") ? (
+                              {/* Hide structured editor for temp rows */}
+                              {!it.id.startsWith("temp-") && (
                                 <div className="mt-3">
                                   <EnduranceEditor planItemId={it.id} athleteId={it.user_id} />
                                 </div>
-                              ) : null}
+                              )}
                             </div>
                           ))}
                         </div>
@@ -473,6 +548,8 @@ export default function CoachAthleteConsolePage() {
                   );
                 })}
               </div>
+
+              {saveError ? <div className="text-xs mt-3" style={{ color: "#fca5a5" }}>{saveError}</div> : null}
             </div>
           )}
         </main>
