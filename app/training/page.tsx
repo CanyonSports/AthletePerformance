@@ -1,30 +1,30 @@
+// app/training/page.tsx
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import NavBar from "@/components/NavBar";
-import * as Supa from "@/lib/supabaseClient";
-import { CalendarDays, CheckCircle2, MessageSquare, XCircle } from "lucide-react";
-import { errMsg } from "@/lib/err";
+import { getSupabase } from "@/lib/supabaseClient";
+import { CalendarDays, CheckCircle2, MessageSquare, XCircle, Trash2, ChevronLeft, ChevronRight } from "lucide-react";
 
+/* ----------------------------- Types ----------------------------- */
 
-
-
+type Role = "athlete" | "coach" | "admin";
 
 type Profile = {
   id: string;
   email: string | null;
   display_name: string | null;
-  role: "athlete" | "coach" | "admin" | null;
+  role: Role | null;
 };
 
 type PlanItem = {
   id: string;
   user_id: string;
-  session_date: string;
+  session_date: string; // yyyy-mm-dd
   title: string;
-  details: any | null;
+  details: string | null;
   duration_min: number | null;
   rpe: number | null;
   status: "planned" | "completed" | "skipped";
@@ -32,6 +32,8 @@ type PlanItem = {
 };
 
 type LinkRow = { coach_id: string; athlete_id: string };
+
+/* ----------------------------- Pure YYYY-MM-DD utils ----------------------------- */
 
 function ymd(d: Date) {
   const y = d.getFullYear();
@@ -41,7 +43,8 @@ function ymd(d: Date) {
 }
 function fromYMD(iso: string) {
   const [y, m, d] = iso.split("-").map(Number);
-  return new Date(y, (m ?? 1) - 1, d ?? 1, 12, 0, 0, 0);
+  // noon local avoids DST shenanigans
+  return new Date((y as number) || 1970, ((m as number) || 1) - 1, (d as number) || 1, 12, 0, 0, 0);
 }
 function addDaysISO(iso: string, days: number) {
   const dt = fromYMD(iso);
@@ -50,19 +53,18 @@ function addDaysISO(iso: string, days: number) {
 }
 function startOfWeekISO(d: Date) {
   const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  const day = (x.getDay() + 6) % 7;
+  const day = (x.getDay() + 6) % 7; // Monday=0
   x.setDate(x.getDate() - day);
   return ymd(x);
 }
+
+/* ----------------------------- Page ----------------------------- */
 
 export default function AthleteTrainingPage() {
   const router = useRouter();
 
   const supabase = useMemo(() => {
-    const anyS = Supa as any;
-    try { if (typeof anyS.getSupabase === "function") return anyS.getSupabase(); } catch {}
-    if (anyS.supabase) return anyS.supabase;
-    return null;
+    try { return getSupabase(); } catch { return null; }
   }, []);
   const isConfigured = Boolean(supabase);
 
@@ -80,17 +82,18 @@ export default function AthleteTrainingPage() {
 
   const chRef = useRef<any>(null);
 
+  /* ----------------------------- Loaders ----------------------------- */
+
   const loadMe = useCallback(async () => {
     if (!isConfigured || !supabase) return;
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { router.push("/login"); return; }
-      const prof = await supabase.from("profiles").select("*").eq("id", user.id).single();
+      const prof = await supabase.from("profiles").select("id,email,display_name,role").eq("id", user.id).single();
       if (prof.error) throw prof.error;
       setMe(prof.data as Profile);
-    } catch (e) {
-      console.error("[training] loadMe error:", e);
-      setNote(errMsg(e));
+    } catch (e: any) {
+      setNote(e?.message || String(e));
     }
   }, [isConfigured, supabase, router]);
 
@@ -103,7 +106,7 @@ export default function AthleteTrainingPage() {
       if (!user) { setItems([]); return; }
       const { data, error } = await supabase
         .from("training_plan_items")
-        .select("*")
+        .select("id,user_id,session_date,title,details,duration_min,rpe,status,created_at")
         .eq("user_id", user.id)
         .gte("session_date", weekStart)
         .lt("session_date", weekEnd)
@@ -111,9 +114,8 @@ export default function AthleteTrainingPage() {
         .order("created_at", { ascending: true });
       if (error) throw error;
       setItems((data || []) as PlanItem[]);
-    } catch (e) {
-      console.error("[training] loadWeek error:", e);
-      setNote(errMsg(e));
+    } catch (e: any) {
+      setNote(e?.message || String(e));
     } finally {
       setLoading(false);
     }
@@ -131,9 +133,8 @@ export default function AthleteTrainingPage() {
       if (links.error) throw links.error;
       const first = (links.data as LinkRow[])?.[0];
       setCoachId(first?.coach_id || null);
-    } catch (e) {
-      console.error("[training] loadCoach error:", e);
-      // silent is fine; leave coachId null
+    } catch {
+      // ignore; optional
     }
   }, [isConfigured, supabase]);
 
@@ -146,14 +147,15 @@ export default function AthleteTrainingPage() {
         if (!user) return;
         const ch = supabase
           .channel(`ath-training-${user.id}`)
-          .on("postgres_changes",
+          .on(
+            "postgres_changes",
             { event: "*", schema: "public", table: "training_plan_items", filter: `user_id=eq.${user.id}` },
             () => { if (mounted) loadWeek(); }
           )
           .subscribe();
         chRef.current = ch;
       } catch (e) {
-        console.error("[training] realtime error:", e);
+        // silent
       }
     })();
     return () => {
@@ -165,17 +167,33 @@ export default function AthleteTrainingPage() {
 
   useEffect(() => { loadMe(); loadWeek(); loadCoach(); }, [loadMe, loadWeek, loadCoach]);
 
+  /* ----------------------------- Actions ----------------------------- */
+
   async function quickUpdateStatus(id: string, status: PlanItem["status"]) {
     if (!isConfigured || !supabase) return;
     const before = items;
-    setItems(prev => prev.map(x => x.id === id ? ({ ...x, status } as PlanItem) : x));
+    // optimistic
+    setItems(prev => prev.map(x => x.id === id ? ({ ...x, status }) : x));
     const { error } = await supabase.from("training_plan_items").update({ status }).eq("id", id);
     if (error) {
-      console.error("[training] quickUpdateStatus error:", error);
+      // rollback
       setItems(before);
-      setNote(errMsg(error));
+      setNote(error.message);
     }
   }
+
+  const deleteItem = useCallback(async (id: string) => {
+    if (!isConfigured || !supabase) return;
+    if (!confirm("Delete this workout?")) return;
+    // optimistic remove
+    setItems(prev => prev.filter(x => x.id !== id));
+    const { error } = await supabase.from("training_plan_items").delete().eq("id", id);
+    if (error) {
+      setNote(error.message);
+      // ensure UI consistent
+      loadWeek();
+    }
+  }, [isConfigured, supabase, loadWeek]);
 
   async function sendMessage() {
     if (!isConfigured || !supabase) return;
@@ -186,7 +204,6 @@ export default function AthleteTrainingPage() {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { setMsgStatus("Sign in required."); return; }
       if (!coachId) { setMsgStatus("No coach linked yet."); return; }
-
       const { error } = await supabase.from("messages").insert({
         athlete_id: user.id,
         coach_id: coachId,
@@ -194,23 +211,26 @@ export default function AthleteTrainingPage() {
         body,
       });
       if (error) throw error;
-
       setMsg("");
       setMsgStatus("Sent!");
       setTimeout(() => setMsgStatus(""), 1000);
-    } catch (e) {
-      console.error("[training] sendMessage error:", e);
-      setMsgStatus(errMsg(e));
+    } catch (e: any) {
+      setMsgStatus(e?.message || String(e));
     }
   }
 
+  /* ----------------------------- Derived ----------------------------- */
+
   const days = Array.from({ length: 7 }, (_, i) => addDaysISO(weekStart, i));
   const sessionsByDay = (iso: string) => items.filter(it => it.session_date === iso);
+
+  /* ----------------------------- Render ----------------------------- */
 
   return (
     <div className="max-w-7xl mx-auto pb-20">
       <NavBar />
 
+      {/* Header / Week Picker */}
       <div className="mt-6 card p-4">
         <div className="flex items-center gap-3" style={{ flexWrap: "wrap" }}>
           <div className="rounded-full p-2 bg-white/10">
@@ -222,25 +242,41 @@ export default function AthleteTrainingPage() {
               Week of {new Date(fromYMD(weekStart)).toLocaleDateString()}
             </div>
           </div>
-         <div className="mt-4">
- 
- <div className="mt-4">
- 
-</div>
-</div>
-         
+
           <div className="ml-auto flex items-center gap-2">
+            <button className="btn btn-dark" onClick={() => setWeekStart(addDaysISO(weekStart, -7))} aria-label="Previous week">
+              <ChevronLeft className="w-4 h-4" />
+            </button>
             <input
               type="date"
               className="px-3 py-2 rounded bg-white/5 border border-white/10"
               value={weekStart}
-              onChange={e => setWeekStart(e.target.value || weekStart)}
+              onChange={e => {
+                const v = e.target.value;
+                if (v) {
+                  // normalize to Monday
+                  setWeekStart(startOfWeekISO(fromYMD(v)));
+                }
+              }}
+              aria-label="Select week start"
             />
+            <button className="btn btn-dark" onClick={() => setWeekStart(addDaysISO(weekStart, 7))} aria-label="Next week">
+              <ChevronRight className="w-4 h-4" />
+            </button>
+
+            {/* Calendar + Program Builder */}
+            <Link href="/training/calendar" className="btn" aria-label="Open month calendar">
+              Calendar
+            </Link>
+            <Link href="/training/programs" className="btn" aria-label="Open program builder">
+              Build Program
+            </Link>
           </div>
         </div>
         {note ? <div className="text-xs mt-2" style={{ color: "#fca5a5" }}>{note}</div> : null}
       </div>
 
+      {/* Message your coach */}
       <div className="mt-4 card p-4">
         <div className="flex items-center gap-2">
           <h3 className="font-semibold">Message your coach</h3>
@@ -262,6 +298,7 @@ export default function AthleteTrainingPage() {
         </div>
       </div>
 
+      {/* Week list */}
       <div className="mt-4 card p-4">
         <div className="flex items-center gap-2">
           <h3 className="font-semibold">This week</h3>
@@ -287,6 +324,7 @@ export default function AthleteTrainingPage() {
                           <div className="font-semibold">{it.title || "(Untitled session)"}</div>
                           <div className="ml-auto flex items-center gap-2">
                             <Link className="btn" href={`/training/session/${it.id}`}>Open</Link>
+
                             {it.status !== "completed" ? (
                               <button className="btn btn-dark" onClick={() => quickUpdateStatus(it.id, "completed")}>
                                 <CheckCircle2 className="w-4 h-4 mr-1" /> Completed
@@ -296,6 +334,7 @@ export default function AthleteTrainingPage() {
                                 Undo
                               </button>
                             )}
+
                             {it.status !== "skipped" ? (
                               <button className="btn btn-dark" onClick={() => quickUpdateStatus(it.id, "skipped")}>
                                 <XCircle className="w-4 h-4 mr-1" /> Skipped
@@ -305,11 +344,24 @@ export default function AthleteTrainingPage() {
                                 Undo
                               </button>
                             )}
+
+                            <button className="btn btn-dark" onClick={() => deleteItem(it.id)} title="Delete workout">
+                              <Trash2 className="w-4 h-4 mr-1" /> Delete
+                            </button>
                           </div>
                         </div>
+
                         <div className="text-xs mt-1" style={{ color: "var(--muted)" }}>
-                          Status: {it.status}{it.duration_min ? ` • ${it.duration_min} min` : ""}{it.rpe ? ` • RPE ${it.rpe}` : ""}
+                          Status: {it.status}
+                          {it.duration_min ? ` • ${it.duration_min} min` : ""}
+                          {typeof it.rpe === "number" ? ` • RPE ${it.rpe}` : ""}
                         </div>
+
+                        {it.details ? (
+                          <div className="text-sm mt-2 opacity-90 whitespace-pre-wrap">
+                            {typeof it.details === "string" ? it.details : JSON.stringify(it.details, null, 2)}
+                          </div>
+                        ) : null}
                       </div>
                     ))}
                   </div>
